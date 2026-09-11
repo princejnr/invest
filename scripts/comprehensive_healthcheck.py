@@ -294,6 +294,61 @@ if all_settings:
             val_str = val_str[:120] + "..."
         print(f"  Key: {s.get('key')} -> Value: {val_str}")
 
+# 14. Committed Portfolio Heat & Margin Saturation Audit (Pillar 1)
+print("\n--- 14. COMMITTED PORTFOLIO HEAT & MARGIN SATURATION (Pillar 1) ---")
+master_rs = query_table("user_risk_settings", "is_master_account=eq.true&limit=1")
+if master_rs:
+    m_cap = float(master_rs[0].get("portfolio_capital") or 10000.0)
+    m_heat_pct = float(master_rs[0].get("max_portfolio_heat_pct") or 0.08)
+    max_budget = m_cap * min(m_heat_pct, 0.08)
+    active_heat_trades = query_table("user_trades", "status=in.(OPEN,PENDING,VPS_PENDING,VPS_PROCESSING)&select=symbol,side,risk_amount,volume,trade_type")
+    total_active_risk = sum(float(t.get("risk_amount") or 0.0) for t in active_heat_trades)
+    heat_util_pct = (total_active_risk / max_budget * 100.0) if max_budget > 0 else 0.0
+
+    print(f"  Master Capital: ${m_cap:.2f} | Heat Cap: {m_heat_pct*100:.1f}% (Max Budget: ${max_budget:.2f})")
+    print(f"  Active Committed Risk: ${total_active_risk:.2f} across {len(active_heat_trades)} open trade legs")
+    print(f"  Heat Utilization: {heat_util_pct:.1f}%")
+
+    pareto_basket = {"BTCUSD", "ETHUSD", "XAUUSD", "XAGUSD", "USOIL", "UKOIL", "US30"}
+    pareto_trades = [t for t in active_heat_trades if t.get("symbol") in pareto_basket]
+    legacy_trades = [t for t in active_heat_trades if t.get("symbol") not in pareto_basket]
+
+    pareto_risk = sum(float(t.get("risk_amount") or 0.0) for t in pareto_trades)
+    legacy_risk = sum(float(t.get("risk_amount") or 0.0) for t in legacy_trades)
+
+    print(f"    • Pareto 80/20 Basket: {len(pareto_trades)} legs | ${pareto_risk:.2f} risk")
+    print(f"    • Legacy / Non-Pareto: {len(legacy_trades)} legs | ${legacy_risk:.2f} risk")
+
+    if heat_util_pct >= 100.0:
+        print(f"  ⚠️ ALERT: Portfolio Heat Saturated! Pre-AI guard will throttle new signal generation.")
+    else:
+        print(f"  🟢 Clean: Heat capacity remaining: ${max(0.0, max_budget - total_active_risk):.2f}")
+else:
+    print("  Master risk settings not found.")
+
+# 15. Pending Approval Opportunities Backlog Audit
+print("\n--- 15. PENDING APPROVAL OPPORTUNITIES BACKLOG ---")
+pending_opps = query_table("trade_opportunities", "status=eq.PENDING_APPROVAL&order=created_at.desc")
+if pending_opps:
+    print(f"  Total setups awaiting review: {len(pending_opps)}")
+    sym_dirs = {}
+    for po in pending_opps:
+        sym = po.get("symbol")
+        side = po.get("side")
+        c_at = po.get("created_at")
+        src = po.get("source")
+        if sym not in sym_dirs:
+            sym_dirs[sym] = set()
+        sym_dirs[sym].add(side)
+        print(f"  [{c_at}] ID: {po.get('id')} | {sym} {side} | Source: {src}")
+
+    conflicts = [sym for sym, sides in sym_dirs.items() if len(sides) > 1]
+    if conflicts:
+        print(f"  ⚠️ CONFLICT: Opposing directional setups exist in queue for: {', '.join(conflicts)}! Prune stale setups before approval.")
+else:
+    print("  Zero opportunities awaiting approval in queue. Clean!")
+
 print("\n================================================================================")
 print("=== HEALTH CHECK COMPLETE ===")
 print("================================================================================")
+

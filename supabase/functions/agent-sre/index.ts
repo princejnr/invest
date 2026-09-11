@@ -160,6 +160,14 @@ serve(async (req) => {
       }
     } catch (_) { /* non-blocking */ }
 
+    // Probe 2C: Database Trigger & Vault Webhook Secret Synchronization Check
+    try {
+      const { data: vaultHealth, error: vaultRpcError } = await supabase.rpc("check_vault_secrets_health");
+      if (!vaultRpcError && vaultHealth && vaultHealth.is_desynced) {
+        issues.push(`⚠️ <b>Webhook Secret Desync:</b> ${vaultHealth.message}`);
+      }
+    } catch (_) { /* non-blocking */ }
+
     // ─────────────────────────────────────────────────────────────
     // PROBE 3: Edge Function Agent Crashes & Critical Errors
     // ─────────────────────────────────────────────────────────────
@@ -483,6 +491,130 @@ serve(async (req) => {
       }
     }
 
+    // 4J. Committed Portfolio Heat & Margin Saturation Audit (Pillar 1)
+    let totalCommittedHeatUsd = 0;
+    let maxHeatBudgetUsd = 0;
+    let heatUtilizationPct = 0;
+    let masterCapital = 0;
+
+    const { data: masterAccountRisk } = await supabase
+      .from("user_risk_settings")
+      .select("portfolio_capital, max_portfolio_heat_pct")
+      .eq("is_master_account", true)
+      .maybeSingle();
+
+    if (masterAccountRisk) {
+      masterCapital = Number(masterAccountRisk.portfolio_capital || 0);
+      const heatPct = Number(masterAccountRisk.max_portfolio_heat_pct || 0.08);
+      maxHeatBudgetUsd = masterCapital * Math.min(heatPct, 0.08);
+
+      const { data: activeHeatTrades } = await supabase
+        .from("user_trades")
+        .select("risk_amount, symbol, status")
+        .in("status", ["OPEN", "PENDING", "VPS_PENDING", "VPS_PROCESSING"]);
+
+      if (activeHeatTrades && activeHeatTrades.length > 0) {
+        totalCommittedHeatUsd = activeHeatTrades.reduce(
+          (acc: number, t: any) => acc + (Number(t.risk_amount) || 0),
+          0
+        );
+      }
+
+      if (maxHeatBudgetUsd > 0) {
+        heatUtilizationPct = Number(((totalCommittedHeatUsd / maxHeatBudgetUsd) * 100).toFixed(1));
+      }
+
+      if (heatUtilizationPct >= 100.0) {
+        issues.push(
+          `⚠️ <b>Portfolio Heat Cap Saturated (${heatUtilizationPct}%):</b> Active committed risk is $${totalCommittedHeatUsd.toFixed(2)} vs max heat budget $${maxHeatBudgetUsd.toFixed(2)} (${((maxHeatBudgetUsd / (masterCapital || 1)) * 100).toFixed(0)}% of $${masterCapital.toFixed(0)}). Pre-AI guard will throttle new setups until positions close.`
+        );
+      }
+    }
+
+    // 4K. Pending Approval Opportunities Backlog Audit & Live Conflict Guard
+    let pendingApprovalCount = 0;
+    const { data: pendingApprovalOpps } = await supabase
+      .from("trade_opportunities")
+      .select("id, symbol, side, created_at")
+      .eq("status", "PENDING_APPROVAL")
+      .order("created_at", { ascending: false });
+
+    if (pendingApprovalOpps && pendingApprovalOpps.length > 0) {
+      pendingApprovalCount = pendingApprovalOpps.length;
+
+      // Check active open positions in user_trades
+      const { data: activeLiveTrades } = await supabase
+        .from("user_trades")
+        .select("symbol, side, status")
+        .in("status", ["OPEN", "PENDING", "VPS_PENDING", "VPS_PROCESSING"]);
+
+      const activePositionsBySymbol: Record<string, string[]> = {};
+      if (activeLiveTrades && activeLiveTrades.length > 0) {
+        for (const lt of activeLiveTrades) {
+          if (!activePositionsBySymbol[lt.symbol]) activePositionsBySymbol[lt.symbol] = [];
+          activePositionsBySymbol[lt.symbol].push(lt.side);
+        }
+      }
+
+      // 4K-1: Auto-reconcile PENDING_APPROVAL setups that directly OPPOSE live open positions
+      const activeOppsRemaining: any[] = [];
+      for (const po of pendingApprovalOpps) {
+        const liveSides = activePositionsBySymbol[po.symbol];
+        if (liveSides && liveSides.some((s) => s !== po.side)) {
+          const reason = `Auto-rejected by Agent SRE: Opposes active ${liveSides.join("/")} live position on ${po.symbol}`;
+          await supabase.from("trade_opportunities").update({
+            status: "REJECTED",
+            ai_risks: reason,
+            closed_at: now.toISOString(),
+          }).eq("id", po.id);
+          autoRemediations.push(`Auto-rejected conflicting PENDING_APPROVAL setup ${po.symbol} ${po.side} (${po.id}) against active live positions`);
+          pendingApprovalCount--;
+        } else {
+          activeOppsRemaining.push(po);
+        }
+      }
+
+      // 4K-2: Prune redundant older duplicate setups on the same symbol older than 12h
+      const twelveHoursAgoIso = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
+      const seenSymbols = new Set<string>();
+      const prunedOppsRemaining: any[] = [];
+      for (const po of activeOppsRemaining) {
+        const key = `${po.symbol}_${po.side}`;
+        if (seenSymbols.has(key) && po.created_at <= twelveHoursAgoIso) {
+          await supabase.from("trade_opportunities").update({
+            status: "EXPIRED",
+            ai_risks: `Duplicate PENDING_APPROVAL signal pruned (>12h old with fresher setup present by agent-sre)`,
+            closed_at: now.toISOString(),
+          }).eq("id", po.id);
+          autoRemediations.push(`Pruned stale duplicate PENDING_APPROVAL signal ${po.symbol} ${po.side} (${po.id})`);
+          pendingApprovalCount--;
+        } else {
+          seenSymbols.add(key);
+          prunedOppsRemaining.push(po);
+        }
+      }
+
+      // 4K-3: Check for remaining opposing directional conflicts within the queue
+      const symbolDirections: Record<string, Set<string>> = {};
+      for (const po of prunedOppsRemaining) {
+        if (!symbolDirections[po.symbol]) symbolDirections[po.symbol] = new Set();
+        symbolDirections[po.symbol].add(po.side);
+      }
+      const conflictingSymbols = Object.entries(symbolDirections)
+        .filter(([_, dirs]) => dirs.size > 1)
+        .map(([sym]) => sym);
+
+      if (conflictingSymbols.length > 0) {
+        issues.push(
+          `⚠️ <b>Conflicting PENDING_APPROVAL Signals:</b> Opposing directions detected in approval queue for: <code>${conflictingSymbols.join(", ")}</code>. Prune or reject stale setups before approval.`
+        );
+      } else if (pendingApprovalCount > 5) {
+        issues.push(
+          `ℹ️ <b>Pending Approval Backlog:</b> ${pendingApprovalCount} trade opportunities awaiting manual operator review in queue.`
+        );
+      }
+    }
+
     // ─────────────────────────────────────────────────────────────
     // PROBE 5: MT5 VPS EA Heartbeat & Connectivity
     // ─────────────────────────────────────────────────────────────
@@ -694,6 +826,10 @@ serve(async (req) => {
       market_data_latency_hours: candleHoursAgo,
       api_timeouts_count: apiTimeoutCount,
       drawdown_breaches_count: drawdownBreachedCount,
+      committed_portfolio_heat_usd: Number(totalCommittedHeatUsd.toFixed(2)),
+      max_heat_budget_usd: Number(maxHeatBudgetUsd.toFixed(2)),
+      heat_utilization_pct: heatUtilizationPct,
+      pending_approval_count: pendingApprovalCount,
       issues_count: issues.length,
       issues,
       remediations_count: autoRemediations.length,
@@ -730,6 +866,9 @@ serve(async (req) => {
 
     const solvencyDisplay = `${solvencyRatio.toFixed(2)}x Reserve Ratio (${solvencyRatio >= 1.5 ? "Healthy" : "Tight"})`;
     const aiErrorsDisplay = `${apiTimeoutCount} in last hour`;
+    const heatDisplay = maxHeatBudgetUsd > 0
+      ? `$${totalCommittedHeatUsd.toFixed(2)} / $${maxHeatBudgetUsd.toFixed(2)} (${heatUtilizationPct}%)`
+      : "N/A";
 
     // 3. Intelligent Alert Throttling (Suppress identical recurring errors within 4 hours)
     let shouldNotifyTelegram = false;
@@ -787,6 +926,10 @@ serve(async (req) => {
       tgLines.push(`• VPS Heartbeat: <code>${vpsLatencyDisplay}</code>`);
       tgLines.push(`• Candle Feed: <code>${candleLatencyDisplay}</code>`);
       tgLines.push(`• Treasury Solvency: <code>${solvencyDisplay}</code>`);
+      tgLines.push(`• Portfolio Heat: <code>${heatDisplay}</code>`);
+      if (pendingApprovalCount > 0) {
+        tgLines.push(`• Pending Approvals: <code>${pendingApprovalCount} setups</code>`);
+      }
       tgLines.push(`• AI Service Errors: <code>${aiErrorsDisplay}</code>`);
 
       await notifyTelegram(tgLines.join("\n"));

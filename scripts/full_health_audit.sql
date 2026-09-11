@@ -278,6 +278,40 @@ SELECT jsonb_pretty(jsonb_build_object(
     ) sub
   ),
 
+  'committed_portfolio_heat', (
+    SELECT jsonb_build_object(
+      'total_committed_risk_usd', COALESCE(SUM(u.risk_amount), 0),
+      'active_legs_count', COUNT(u.id),
+      'master_capital', m.portfolio_capital,
+      'max_heat_budget_usd', ROUND((m.portfolio_capital * LEAST(COALESCE(m.max_portfolio_heat_pct, 0.08), 0.08))::numeric, 2),
+      'heat_utilization_pct', CASE WHEN m.portfolio_capital > 0 THEN ROUND(((COALESCE(SUM(u.risk_amount), 0) / (m.portfolio_capital * LEAST(COALESCE(m.max_portfolio_heat_pct, 0.08), 0.08))) * 100)::numeric, 1) ELSE 0 END,
+      'is_saturated', COALESCE(SUM(u.risk_amount), 0) >= (m.portfolio_capital * LEAST(COALESCE(m.max_portfolio_heat_pct, 0.08), 0.08))
+    )
+    FROM user_risk_settings m
+    LEFT JOIN user_trades u ON u.status IN ('OPEN', 'PENDING', 'VPS_PENDING', 'VPS_PROCESSING')
+    WHERE m.is_master_account = true
+    GROUP BY m.portfolio_capital, m.max_portfolio_heat_pct
+  ),
+
+  'pending_approval_backlog', (
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+      'id', sub.id,
+      'symbol', sub.symbol,
+      'side', sub.side,
+      'source', sub.source,
+      'confidence', sub.confidence,
+      'created_at', sub.created_at,
+      'hours_old', sub.hours_old
+    )), '[]'::jsonb)
+    FROM (
+      SELECT id, symbol, side, source, confidence, created_at,
+             ROUND(EXTRACT(EPOCH FROM (NOW() - created_at)) / 3600, 1) as hours_old
+      FROM trade_opportunities
+      WHERE status = 'PENDING_APPROVAL'
+      ORDER BY created_at DESC
+    ) sub
+  ),
+
   'global_settings', (
     SELECT COALESCE(jsonb_object_agg(key, value), '{}'::jsonb)
     FROM system_settings
