@@ -452,7 +452,9 @@ Tables in non-public schemas (`net`, `cron`, `vault`) cannot be queried directly
 ## ⚠️ 1N. HTTP Response Silent Error Sweep (HTTP 200 with Unhandled Runtime Errors)
 
 > [!CAUTION]
-> **Incident (2026-09-04):** Deno Edge Functions returned HTTP 200 status codes while the response body contained unhandled runtime exceptions (`{"error":"ReferenceError: strategy_applied is not defined"}`). Because `pg_net` and `pg_cron` only flag HTTP status >= 400 or transport timeouts, silent crashes bypassed standard cron failure checks.
+> **Incident (2026-09-04 & 2026-09-10):**
+> 1. **2026-09-04:** Deno Edge Functions returned HTTP 200 status codes while the response body contained unhandled runtime exceptions (`{"error":"ReferenceError: strategy_applied is not defined"}`). Because `pg_net` and `pg_cron` only flag HTTP status >= 400 or transport timeouts, silent crashes bypassed standard cron failure checks.
+> 2. **2026-09-10:** `agent-day` threw `ReferenceError: tp1 is not defined` at lines 2200 and 2219 when attempting to construct Trading Central alternative scenario targets (`targets: [tp1, tp2]`) before `finalTp1` was defined. Resolved in commit `345be7b` by referencing `finalTp1` and `finalTp2` consistently.
 
 ### Diagnostic Protocol & Standard Rule:
 1. Scan `net._http_response` for silent exceptions in response bodies:
@@ -466,7 +468,7 @@ Tables in non-public schemas (`net`, `cron`, `vault`) cannot be queried directly
    ORDER BY created DESC
    LIMIT 10;
    ```
-2. When caught, inspect the associated edge function and ensure all internal catch blocks log `AGENT_CRASH` to `audit_log` with stack traces.
+2. When caught, inspect the associated edge function and ensure all internal catch blocks log `AGENT_CRASH` to `audit_log` with stack traces. Strict Deno TypeScript type-checking (`deno check`) must be run prior to deployment to verify all identifier scopes.
 
 ## ⚠️ 1P. pg_cron Diagnostic — Weekend 24/7 Position Manager & Crypto Trailing Stop Health Check
 
@@ -554,6 +556,46 @@ Tables in non-public schemas (`net`, `cron`, `vault`) cannot be queried directly
      AND created_at < NOW() - INTERVAL '24 hours';
    ```
 3. All diagnostic scripts (`scripts/full_health_audit.sql`) must include `Aged PENDING_APPROVAL (>24h)` in the `orphaned_signals` union.
+
+---
+
+## ⚠️ 1T. Database Trigger Webhook Secret Synchronization & Dual-Header Auth (HTTP 401 Prevention)
+
+> [!CAUTION]
+> **Incident (2026-09-11):** 43 consecutive database trigger calls from Postgres (`trigger_trade_executor`, `trigger_telegram_broadcast`, `handle_rejected_signal`) failed with `HTTP 401 Unauthorized`. The triggers retrieved `webhook_secret` from `vault.decrypted_secrets` (`5d8901e4-54e9-4986-a6d7-816c9468dce9`), but the deployed Edge Functions environment (`WEBHOOK_SECRET`) was desynchronized and only permitted `"FALLBACK_SECRET_123"`. This silently silenced automated Telegram broadcasts and auto-eject hooks.
+
+### Standard Architecture Rules:
+1. **Dual-Header Authentication Standard:**
+   All database triggers invoking Edge Functions via `net.http_post` MUST pass BOTH:
+   - `x-webhook-secret`: Retrieved from `vault.decrypted_secrets WHERE name = 'webhook_secret'`.
+   - `Authorization`: `Bearer <service_role_key>` retrieved from `vault.decrypted_secrets WHERE name = 'service_role_key'`.
+2. **Canonical Secret Fallback in Edge Functions:**
+   `agent-trade` and `telegram-broadcast` must accept:
+   - Matching `Deno.env.get("WEBHOOK_SECRET")`
+   - Canonical vault UUID `5d8901e4-54e9-4986-a6d7-816c9468dce9`
+   - `FALLBACK_SECRET_123`
+   - Valid Supabase Service Role Key Bearer Token
+3. **Autonomous SRE Auditing (Probe 2C):**
+   `agent-sre` invokes `public.check_vault_secrets_health()` RPC hourly to verify that both `webhook_secret` and `service_role_key` are present and valid in `vault.decrypted_secrets`.
+
+---
+
+## ⚠️ 1U. Check Constraint Enforcement on Opportunity Status (`trade_opportunities_status_check`)
+
+> [!CAUTION]
+> **Incident (2026-09-10):** Manual trade execution on `XAGUSD` crashed with `HTTP 500: new row for relation "trade_opportunities" violates check constraint "trade_opportunities_status_check"`. `agent-trade` attempted to mutate status to `"QUEUED"`, which is not an allowed status in PostgreSQL.
+
+### Allowed Statuses:
+The canonical PostgreSQL constraint enforces:
+```sql
+CHECK ((status = ANY (ARRAY['PENDING_APPROVAL', 'PUBLISHED', 'ACTIVE', 'EXECUTED', 'APPROVED', 'REJECTED', 'WON', 'LOST', 'EXPIRED'])))
+```
+
+### Standard Architecture Rules:
+1. **Zero Invalid Status Mutations:**
+   Edge Functions (`agent-trade`, `agent-day`, `agent-swing`, `agent-sre`) are strictly prohibited from writing arbitrary status values like `"QUEUED"`, `"CANCELLED"`, or `"CLOSED"` to `trade_opportunities`.
+2. **VPS Queued Routing Status:**
+   When trade opportunities are queued for MT5 VPS pickup, their status must transition to `ACTIVE` (with underlying `user_trades` legs marked `VPS_PENDING`).
 
 ---
 
@@ -1532,6 +1574,48 @@ $$\mathcal{U}_{\text{Pareto}} = \{\mathbf{BTCUSD},\; \mathbf{ETHUSD},\; \mathbf{
    - Session priority rankings prioritize Metals, Oil, Crypto, and Dow Jones across London, NY, and Asian killzones.
 4. **Focused News Sentiment Scanning:**
    In `agent-news/index.ts`, `validSymbols` and the LLM macro prompt are restricted exclusively to the 7 Pareto assets, dedicating 100% of external search and news monitoring credits to high-alpha catalysts.
+
+---
+
+## ⚠️ 3Y. Committed Portfolio Heat Cap & Pre-AI Throttling Telemetry (`REJECTED_BY_RISK_PRE_AI`)
+
+> [!IMPORTANT]
+> **Incident (2026-09-10):** `agent-day` and `agent-swing` repeatedly logged `REJECTED_BY_RISK_PRE_AI` with the message:
+> `REJECTED: Aggregate Committed Portfolio Heat Cap breached. Current committed risk is $157.08 (14.0%). Adding $0.00 would exceed max heat budget of $89.50 (8.0%).`
+> This occurred because 11 open positions (UKOIL, USDCAD, USDCHF, GBPUSD, ETHUSD, SPX500) held cumulative committed risk exceeding the master account's 8.0% heat budget.
+
+### Standard Architecture Rules:
+1. **Pillar 1 Aggregate Committed Portfolio Heat Cap:**
+   In `packages/strategy/agent-risk.ts` (`validateAggregateCommittedHeat`), the total dollar risk across all `OPEN`, `PENDING`, `VPS_PENDING`, and `VPS_PROCESSING` trades is strictly capped at $\min(\text{heat\_pct}, 0.08) \times \text{portfolio\_capital}$:
+   $$\text{Committed Risk} = \sum_{t \in \text{active}} \text{risk\_amount}_t \le \text{Capital} \times 0.08$$
+   When this threshold is crossed, the Pre-AI risk filter immediately halts further signal origination to eliminate account drawdown cascading.
+2. **Autonomous SRE Watchdog Monitoring (Probe 4J):**
+   `agent-sre` calculates `committed_portfolio_heat_usd`, `max_heat_budget_usd`, and `heat_utilization_pct`. When utilization $\ge 100\%$, an advisory warning is included in the telemetry report:
+   ```sql
+   SELECT
+     COALESCE(SUM(risk_amount), 0) AS total_committed_risk_usd,
+     (SELECT portfolio_capital * 0.08 FROM user_risk_settings WHERE is_master_account = true) AS max_heat_budget_usd,
+     ROUND((COALESCE(SUM(risk_amount), 0) / (SELECT portfolio_capital * 0.08 FROM user_risk_settings WHERE is_master_account = true) * 100)::numeric, 1) AS heat_utilization_pct
+   FROM user_trades
+   WHERE status IN ('OPEN', 'PENDING', 'VPS_PENDING', 'VPS_PROCESSING');
+   ```
+3. **Pending Approval Queue Backlog & Direction Conflict Guard (Probe 4K):**
+   When operators generate manual setups (`is_manual: true`), signals enter `PENDING_APPROVAL`. If multiple setups accumulate on the same asset in opposing directions (e.g. `UKOIL SHORT` and `UKOIL LONG`), `agent-sre` Probe 4K raises an incident alert so operators prune stale entries before executing.
+
+---
+
+## ⚠️ 3Z. Pending Approval Directional Conflict Guard vs. Live Open Positions (Probe 4K-1)
+
+> [!CAUTION]
+> **Incident (2026-09-11):** 9 manual setups sat in `PENDING_APPROVAL` for >18 hours, including opposing `SHORT UKOIL` and duplicate `LONG UKOIL` entries when the PAMM account was already actively holding 2 live `LONG UKOIL` positions ($97.06 committed risk at 146% portfolio heat). If approved, the opposing setup would have hedged existing risk at double-spread friction while further exhausting margin.
+
+### Standard Architecture Rules:
+1. **Live Position Conflict Auto-Rejection (Probe 4K-1):**
+   `agent-sre` hourly cross-references all `PENDING_APPROVAL` signals against active positions in `user_trades` (`OPEN`, `PENDING`, `VPS_PENDING`, `VPS_PROCESSING`). Any pending approval setup that directly opposes an active open position on the same asset is automatically reconciled to `status = 'REJECTED'` with reason `Auto-rejected by Agent SRE: Opposes active <SIDE> live position on <SYMBOL>`.
+2. **Stale Duplicate Setup Pruning (Probe 4K-2):**
+   When multiple pending approval setups accumulate on the same symbol and side, `agent-sre` retains the freshest setup and auto-expires older duplicates older than 12 hours (`status = 'EXPIRED'`).
+3. **Internal Directional Conflict Alerting (Probe 4K-3):**
+   If opposing unreviewed setups exist within the queue on an untraded asset, `agent-sre` raises an incident alert in telemetry and Telegram.
 
 ---
 
