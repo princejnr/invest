@@ -143,22 +143,19 @@ serve(async (req) => {
     const { data: httpErrors, error: httpFetchError } = await supabase.rpc("check_http_response_errors");
 
     if (!httpFetchError && httpErrors && httpErrors.length > 0) {
-      issues.push(`⚠️ <b>HTTP / Webhook Errors (${httpErrors.length} in last hour):</b> Status ${httpErrors[0].status_code || "ERR"}: ${httpErrors[0].error_msg || "HTTP Error"}`);
-    }
+      const networkOrStatusErrors = httpErrors.filter((e: any) => e.error_msg || (e.status_code && e.status_code >= 400));
+      const contentSystemErrors = httpErrors.filter((e: any) => {
+        const c = String(e.content || "");
+        return /System Error/i.test(c) || /ReferenceError/i.test(c) || /TypeError/i.test(c);
+      });
 
-    // Probe 2B: Unhandled System Errors inside HTTP 200 Responses
-    try {
-      const { data: systemErrorResponses } = await supabase
-        .from("net._http_response")
-        .select("id, status_code, content, created")
-        .or("content.ilike.%System Error%,content.ilike.%ReferenceError%,content.ilike.%TypeError%")
-        .gte("created", oneHourAgoIso)
-        .limit(5);
-
-      if (systemErrorResponses && systemErrorResponses.length > 0) {
-        issues.push(`🚨 <b>Unhandled System Errors in Responses (${systemErrorResponses.length} in last hour):</b> Response contains Reference/Type error.`);
+      if (networkOrStatusErrors.length > 0) {
+        issues.push(`⚠️ <b>HTTP / Webhook Errors (${networkOrStatusErrors.length} in last hour):</b> Status ${networkOrStatusErrors[0].status_code || "ERR"}: ${networkOrStatusErrors[0].error_msg || "HTTP Error"}`);
       }
-    } catch (_) { /* non-blocking */ }
+      if (contentSystemErrors.length > 0) {
+        issues.push(`🚨 <b>Unhandled System Errors in Responses (${contentSystemErrors.length} in last hour):</b> Response contains Reference/Type error.`);
+      }
+    }
 
     // Probe 2C: Database Trigger & Vault Webhook Secret Synchronization Check
     try {

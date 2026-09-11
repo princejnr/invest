@@ -88,11 +88,15 @@ serve(async (req) => {
 
           await supabase.from("market_context").insert({
             symbol: "GLOBAL",
+            agent_persona: "MACRO_SCOUT",
+            timeframe: "M1",
             macro_bias: "VELOCITY_LOCKOUT",
             expires_at: expiresAt,
-            confidence_score: 100,
-            ai_narrative: `[Flash-Fill Circuit Breaker] ${recentTimestamps.length} trades filled in <60s. Halting pending execution for 15 minutes to protect against simultaneous execution shocks.`,
-            dominant_driver: "EXECUTION_VELOCITY_CIRCUIT_BREAKER"
+            narrative: `[Flash-Fill Circuit Breaker] ${recentTimestamps.length} trades filled in <60s. Halting pending execution for 15 minutes to protect against simultaneous execution shocks.`,
+            key_levels: {
+              confidence_score: 100,
+              dominant_driver: "EXECUTION_VELOCITY_CIRCUIT_BREAKER"
+            }
           });
 
           // Dispatch Telegram Alert

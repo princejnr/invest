@@ -679,7 +679,7 @@ serve(async (req) => {
       const signal = payload.record || (payload.opportunity_id ? (await supabase.from("trade_opportunities").select("*").eq("id", payload.opportunity_id).single()).data : null);
       const oldSignal = payload.old_record;
 
-      if (!signal) return new Response("No signal record provided for auto-eject", { status: 400 });
+      if (!signal || !signal.id) return new Response("No valid signal record provided for auto-eject", { status: 400 });
       if (oldSignal && oldSignal.status === "REJECTED") {
         return new Response("Signal is not newly rejected. Ignoring.", { status: 200 });
       }
@@ -1049,7 +1049,7 @@ serve(async (req) => {
         .select(`
           id, meta_api_order_id, symbol, side, status, trade_type, user_id, open_price, created_at, opportunity_id,
           trade_opportunities (
-            timeframe, entry_plan_json, stop_plan_json, take_profit_json
+            id, timeframe, entry_plan_json, stop_plan_json, take_profit_json
           )
         `)
         .in("status", ["OPEN", "VPS_CLOSE", "VPS_PENDING"])
@@ -1106,7 +1106,7 @@ serve(async (req) => {
                  // Fetch the recovered trade to manage it in this cycle
                  const { data: recoveredTrade } = await supabase
                    .from("user_trades")
-                   .select(`id, meta_api_order_id, symbol, side, status, trade_type, user_id, open_price, created_at, opportunity_id, trade_opportunities(timeframe, entry_plan_json, stop_plan_json, take_profit_json)`)
+                   .select(`id, meta_api_order_id, symbol, side, status, trade_type, user_id, open_price, created_at, opportunity_id, trade_opportunities(id, timeframe, entry_plan_json, stop_plan_json, take_profit_json)`)
                    .eq("meta_api_order_id", posId)
                    .maybeSingle();
                    
@@ -1525,7 +1525,7 @@ for (const [orderId, trade] of orderMap) {
                           side: altSide,
                           timeframe: opp.timeframe || "30m",
                           status: "APPROVED",
-                          source: opp.source || "agent-day",
+                          source: "agent-trade-contingent-flip",
                           entry_plan_json: {
                             price: altEntry,
                             order_type: altSide === "LONG" ? "BUY MARKET" : "SELL MARKET",
@@ -1538,7 +1538,6 @@ for (const [orderId, trade] of orderMap) {
                           confidence: 82,
                           ai_summary: flipRationale,
                           ai_risks: "Managed by AI Risk Officer (Contingent Alternative Flip)",
-                          model_id: "agent-trade-contingent-flip",
                         })
                         .select("id")
                         .single();
@@ -1617,9 +1616,10 @@ for (const [orderId, trade] of orderMap) {
                  console.log(`[Position Manager] DE-LEVERAGING: Moving SL to Breakeven for ${orderId} @ ${beSl}`);
                  const currentTp = position.takeProfit || opp.take_profit_json?.tp;
                  
-                 if (opp.id) {
-                   const updatedStopJson = { ...(opp.stop_plan_json || {}), stop: beSl };
-                   await supabase.from("trade_opportunities").update({ stop_plan_json: updatedStopJson }).eq("id", opp.id);
+                 const oppId = opp?.id || trade.opportunity_id;
+                 if (oppId) {
+                   const updatedStopJson = { ...(opp?.stop_plan_json || {}), stop: beSl };
+                   await supabase.from("trade_opportunities").update({ stop_plan_json: updatedStopJson }).eq("id", oppId);
                  }
 
                  if (!isVpsAlive) {
@@ -1664,9 +1664,10 @@ for (const [orderId, trade] of orderMap) {
               console.log(`[Position Manager] EOD PROFIT LOCK: Moving SL to Breakeven for ${orderId} (${trade.symbol}) @ ${beSl}`);
               const currentTp = position.takeProfit || opp.take_profit_json?.tp;
 
-              if (opp.id) {
-                const updatedStopJson = { ...(opp.stop_plan_json || {}), stop: beSl };
-                await supabase.from("trade_opportunities").update({ stop_plan_json: updatedStopJson }).eq("id", opp.id);
+              const oppId = opp?.id || trade.opportunity_id;
+              if (oppId) {
+                const updatedStopJson = { ...(opp?.stop_plan_json || {}), stop: beSl };
+                await supabase.from("trade_opportunities").update({ stop_plan_json: updatedStopJson }).eq("id", oppId);
               }
 
               if (!isVpsAlive) {
@@ -1826,18 +1827,23 @@ for (const [orderId, trade] of orderMap) {
           if (newSl !== null) {
             console.log(`[Position Manager] ${trade.symbol} ${orderId}: ${actionName} — SL ${currentSl} → ${newSl}`);
             
+            const targetOppId = opp?.id || trade.opportunity_id;
             if (isVpsAlive) {
                 // --- VPS EA ROUTING: Save modification to DB instead of MetaAPI ---
-                const { data: currentOpp } = await supabase.from("trade_opportunities").select("stop_plan_json").eq("id", opp.id).single();
-                if (currentOpp) {
-                   const updatedJson = { ...currentOpp.stop_plan_json, stop: newSl };
-                   const modRes = await supabase.from("trade_opportunities").update({ stop_plan_json: updatedJson }).eq("id", opp.id);
-                   
-                   if (!modRes.error) {
-                     moves.push({ symbol: trade.symbol, action: actionName + " (VPS)", from: currentSl, to: newSl });
-                   } else {
-                     errors.push(`${trade.symbol} ${orderId}: modify failed (DB Error)`);
-                   }
+                if (targetOppId) {
+                  const { data: currentOpp } = await supabase.from("trade_opportunities").select("stop_plan_json").eq("id", targetOppId).maybeSingle();
+                  if (currentOpp) {
+                     const updatedJson = { ...currentOpp.stop_plan_json, stop: newSl };
+                     const modRes = await supabase.from("trade_opportunities").update({ stop_plan_json: updatedJson }).eq("id", targetOppId);
+                     
+                     if (!modRes.error) {
+                       moves.push({ symbol: trade.symbol, action: actionName + " (VPS)", from: currentSl, to: newSl });
+                     } else {
+                       errors.push(`${trade.symbol} ${orderId}: modify failed (DB Error)`);
+                     }
+                  }
+                } else {
+                  moves.push({ symbol: trade.symbol, action: actionName + " (VPS - unmapped opp)", from: currentSl, to: newSl });
                 }
             } else {
                 // --- METAAPI FAILOVER ---
@@ -1851,10 +1857,12 @@ for (const [orderId, trade] of orderMap) {
                    body: JSON.stringify(modifyPayload)
                 });
                 if (modRes.ok) {
-                    const { data: currentOpp } = await supabase.from("trade_opportunities").select("stop_plan_json").eq("id", opp.id).single();
-                    if (currentOpp) {
-                       const updatedJson = { ...currentOpp.stop_plan_json, stop: newSl };
-                       await supabase.from("trade_opportunities").update({ stop_plan_json: updatedJson }).eq("id", opp.id);
+                    if (targetOppId) {
+                      const { data: currentOpp } = await supabase.from("trade_opportunities").select("stop_plan_json").eq("id", targetOppId).maybeSingle();
+                      if (currentOpp) {
+                         const updatedJson = { ...currentOpp.stop_plan_json, stop: newSl };
+                         await supabase.from("trade_opportunities").update({ stop_plan_json: updatedJson }).eq("id", targetOppId);
+                      }
                     }
                     moves.push({ symbol: trade.symbol, action: actionName + " (MetaAPI Failover)", from: currentSl, to: newSl });
                 } else {

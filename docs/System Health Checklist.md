@@ -648,6 +648,45 @@ CHECK ((status = ANY (ARRAY['PENDING_APPROVAL', 'PUBLISHED', 'ACTIVE', 'EXECUTED
 
 ---
 
+## ⚠️ 1Z. PostgREST Embedded Join ID Requirement & Trailing Stop DB Synchronization
+
+> [!CAUTION]
+> **Incident (2026-09-11):** `agent-trade`'s Position Manager logged 79 consecutive `HTTP 400 Bad Request` errors:
+> `GET /rest/v1/trade_opportunities?select=stop_plan_json&id=eq.undefined`
+> The embedded join query `trade_opportunities(timeframe, entry_plan_json, stop_plan_json, take_profit_json)` omitted the `id` column. When winning trades triggered Early Breakeven (+0.35R) or Stepped Trailing Stops (+1.5R/+0.5R lock), `opp.id` evaluated to `undefined`, causing the DB update to fail and leaving the stop loss desynchronized in the database.
+
+### Standard Architecture Rules:
+1. **Explicit ID Selection in Embedded Joins:**
+   Any PostgREST relation query on `trade_opportunities` MUST explicitly include `id`:
+   ```ts
+   // ✅ CORRECT: Explicitly select id in the relation
+   .select(`
+     id, meta_api_order_id, symbol, side, status, trade_type, user_id, open_price, created_at, opportunity_id,
+     trade_opportunities (
+       id, timeframe, entry_plan_json, stop_plan_json, take_profit_json
+     )
+   `)
+   ```
+2. **Defensive Target ID Resolution:**
+   When mutating or querying parent opportunities, code must always fall back to `trade.opportunity_id`:
+   ```ts
+   const targetOppId = opp?.id || trade.opportunity_id;
+   if (targetOppId) {
+     await supabase.from("trade_opportunities").update({ stop_plan_json: updatedJson }).eq("id", targetOppId);
+   }
+   ```
+3. **Diagnostic Query:**
+   Inspect ClickHouse unified logs for any `undefined` parameter leaks:
+   ```sql
+   SELECT timestamp, event_message 
+   FROM logs 
+   WHERE source = 'edge_logs' 
+     AND event_message LIKE '%id=eq.undefined%'
+   ORDER BY timestamp DESC LIMIT 10;
+   ```
+
+---
+
 ## 2. Autonomous Agent Activity
 Verify that the AI agents are actively evaluating the market and producing expected heartbeat logs.
 
@@ -947,6 +986,76 @@ Once an opportunity is generated for a symbol with status `APPROVED`, `PENDING_A
 In `packages/strategy/agent-risk.ts` (`validateAccountStopBounds`), stop loss distances are bounded by master account equity:
 $$\text{Max Allowable Stop Distance} = \frac{\text{Capital} \times 0.02}{0.01 \times \text{PointValue}}$$
 For `UKOIL` (1,000 bbl contract, $10/point on 0.01 lot) on a $1,020 account, the stop distance is hard-capped at **$2.04 (204 points)**. Candidates requiring wider stops must either tighten into a discount entry or be discarded pre-AI.
+
+---
+
+## ⚠️ 2U. Schema Standard — market_context Constraint & Column Compliance (Lockouts, Timeframe, Upserts)
+
+> [!CAUTION]
+> **Incident (2026-09-11):** 64 consecutive `HTTP 400 Bad Request` errors occurred across `vps-callback` and `agent-day` on `market_context` mutations:
+> 1. `vps-callback` attempted to write `macro_bias: "VELOCITY_LOCKOUT"`, but the database check constraint `market_context_macro_bias_check` was restricted to `('BULLISH', 'BEARISH', 'NEUTRAL')`. Furthermore, it omitted the `NOT NULL` columns `agent_persona` and `timeframe`.
+> 2. `agent-day` attempted to write `macro_bias: "VOLATILITY_LOCKOUT"` (also violating the check constraint) and omitted `timeframe`, while using `.upsert(..., { onConflict: "symbol,agent_persona" })` where no corresponding unique constraint existed.
+
+### Standard Architecture Rules:
+1. **Permitted Macro Biases:**
+   The `market_context_macro_bias_check` constraint permits:
+   `'BULLISH'`, `'BEARISH'`, `'NEUTRAL'`, `'VOLATILITY_LOCKOUT'`, `'VELOCITY_LOCKOUT'`.
+2. **Mandatory Non-Null Fields:**
+   Any insert to `market_context` MUST provide:
+   - `timeframe`: (e.g. `'30m'`, `'M1'`, `'4h'`).
+   - `agent_persona`: (e.g. `'AGENT_DAY'`, `'MACRO_SCOUT'`, `'AGENT_SWING'`).
+   - `symbol`: canonical instrument symbol.
+   - `macro_bias`: one of the permitted enum strings.
+   - `expires_at`: ISO timestamp for automatic cache invalidation.
+3. **Safe Upsert / Idempotency Pattern:**
+   Do not call `.upsert(..., { onConflict: 'symbol,agent_persona' })` unless an explicit database UNIQUE index exists on those exact columns. Instead, use an expire-then-insert pattern:
+   ```ts
+   // Invalidate prior active lockouts for symbol & persona
+   await supabase
+     .from("market_context")
+     .update({ expires_at: new Date().toISOString() })
+     .eq("symbol", symbol)
+     .eq("agent_persona", persona)
+     .gt("expires_at", new Date().toISOString());
+
+   // Insert fresh context row with complete schema fields
+   await supabase
+     .from("market_context")
+     .insert({
+       symbol,
+       agent_persona: persona,
+       macro_bias: "VOLATILITY_LOCKOUT",
+       timeframe: "30m",
+       expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+       bias_rationale: "Extreme ATR expansion lockout",
+     });
+   ```
+
+---
+
+## ⚠️ 2V. Schema Standard — trade_opportunities UUID Column Typing on Contingent Reversals
+
+> [!CAUTION]
+> **Incident (2026-09-11):** When `agent-trade`'s execution engine evaluated an immediate contingent flip / alternative scenario upon stop-out, it attempted:
+> `model_id: "agent-trade-contingent-flip"`
+> Because `model_id` in `trade_opportunities` is strictly typed `UUID` referencing AI models, Postgres rejected the insertion with `22P02 invalid input syntax for type uuid: "agent-trade-contingent-flip"`.
+
+### Standard Rule:
+- `model_id` (UUID): Exclusively for registered AI model UUIDs (or `null` for heuristic / programmatic orders).
+- `source` (TEXT): Free-form string identifier for the signal generator (e.g. `'agent-day'`, `'agent-swing'`, `'agent-trade'`, `'agent-news'`).
+- In contingent flip insertions:
+  ```ts
+  // ✅ CORRECT: Leave model_id as null, store routing identifier in source and metadata
+  await supabase.from("trade_opportunities").insert({
+    symbol: trade.symbol,
+    side: opposingSide,
+    source: "agent-trade",
+    model_id: null,
+    status: "APPROVED",
+    ai_summary: `Contingent flip triggered by stop-out on trade ${trade.id}`,
+    // ...
+  });
+  ```
 
 ---
 

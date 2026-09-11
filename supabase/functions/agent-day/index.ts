@@ -2244,27 +2244,39 @@ serve(async (req) => {
               // Clean up any active sniper watchlists for this symbol to prevent duplicate execution
               await supabase.from("trade_watchlists").update({ status: 'CANCELLED' }).eq('symbol', symbol).eq('status', 'WATCHING');
               
-              // Upsert bifurcated scenario tree into market_context (Trading Central standard)
-              await supabase
-                .from("market_context")
-                .upsert({
-                  symbol,
-                  agent_persona: "INTRADAY_TRADER",
-                  macro_bias: dbSide === "LONG" ? "BULLISH" : "BEARISH",
-                  invalidation_price: stop_loss,
-                  narrative: `[Intraday Trade: ${dbSide} (Conf: ${confidence_score}%)] Entry: $${entry_price} | Pivot/SL: $${stop_loss} | TP: $${take_profit}. ${institutional_rationale}`,
-                  key_levels: {
-                    pivot_point: stop_loss,
-                    preferred_scenario: {
-                      direction: dbSide,
-                      entry: entry_price,
-                      targets: [finalTp1, finalTp2],
-                      invalidation: stop_loss,
+              // Write bifurcated scenario tree into market_context (Trading Central standard)
+              try {
+                await supabase
+                  .from("market_context")
+                  .update({ expires_at: new Date().toISOString() })
+                  .eq("symbol", symbol)
+                  .eq("agent_persona", "INTRADAY_TRADER")
+                  .gt("expires_at", new Date().toISOString());
+
+                await supabase
+                  .from("market_context")
+                  .insert({
+                    symbol,
+                    agent_persona: "INTRADAY_TRADER",
+                    timeframe: "30m",
+                    macro_bias: dbSide === "LONG" ? "BULLISH" : "BEARISH",
+                    invalidation_price: stop_loss,
+                    narrative: `[Intraday Trade: ${dbSide} (Conf: ${confidence_score}%)] Entry: $${entry_price} | Pivot/SL: $${stop_loss} | TP: $${take_profit}. ${institutional_rationale}`,
+                    key_levels: {
+                      pivot_point: stop_loss,
+                      preferred_scenario: {
+                        direction: dbSide,
+                        entry: entry_price,
+                        targets: [finalTp1, finalTp2],
+                        invalidation: stop_loss,
+                      },
+                      alternative_scenario: tcLevels.alternative_scenario,
                     },
-                    alternative_scenario: tcLevels.alternative_scenario,
-                  },
-                  expires_at: new Date(Date.now() + 10 * 60 * 60 * 1000).toISOString(),
-                }, { onConflict: "symbol,agent_persona" });
+                    expires_at: new Date(Date.now() + 10 * 60 * 60 * 1000).toISOString(),
+                  });
+              } catch (mcErr: any) {
+                console.warn(`[Intraday Trader] Error updating market_context for ${symbol}:`, mcErr?.message || mcErr);
+              }
 
               results.push({ 
                 symbol, 

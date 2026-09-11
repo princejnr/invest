@@ -244,6 +244,21 @@ SELECT jsonb_pretty(jsonb_build_object(
     ) sub
   ),
 
+  'active_market_lockouts', (
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+      'id', id,
+      'symbol', symbol,
+      'macro_bias', macro_bias,
+      'agent_persona', agent_persona,
+      'timeframe', timeframe,
+      'expires_at', expires_at,
+      'bias_rationale', bias_rationale
+    )), '[]'::jsonb)
+    FROM market_context
+    WHERE macro_bias IN ('VOLATILITY_LOCKOUT', 'VELOCITY_LOCKOUT')
+      AND expires_at > NOW()
+  ),
+
   'treasury_status', (
     SELECT value FROM system_settings WHERE key = 'treasury_status'
   ),
