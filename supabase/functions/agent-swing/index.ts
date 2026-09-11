@@ -9,7 +9,7 @@ import { isMarketOpen, isCrypto, isIndex } from "../../../packages/core/market.t
 import { revalidateOpportunity } from "../../../packages/strategy/revalidation.ts";
 
 import { getContextSnapshot, LogicContext, isBullishEngulfing, isBearishRejection, computeHtfFibAlignment, calibrateProbability, computeLiquiditySweepScore, calculateInstitutionalTradingCentralLevels, calculateFibonacciProjections, FibonacciProjection, FibonacciProjectionsResult } from "../../../packages/strategy/indicators.ts";
-import { validateGlobalSignal, validateCentralBankIntervention } from "../../../packages/strategy/agent-risk.ts";
+import { validateGlobalSignal, validateCentralBankIntervention, validateAccountStopBounds, ASSET_CONTRACT_SIZES } from "../../../packages/strategy/agent-risk.ts";
 import OpenAI from "npm:openai";
 import { z } from "npm:zod";
 
@@ -1181,7 +1181,8 @@ serve(async (req) => {
 
           // === ASSET ISOLATION (PYRAMIDING) GUARD ===
           sendEvent({ type: "progress", message: `[Pre-AI Guard] Validating global signal constraints for ${symbol}...` });
-          const riskValidation = await validateGlobalSignal(supabase, symbol, snapshot, isManual);
+          const candidateSide = (snapshot.trend_alignment?.startsWith('BULLISH') || (snapshot as any).weekly_trend?.startsWith('BULLISH')) ? 'LONG' : (((snapshot.trend_alignment?.startsWith('BEARISH') || (snapshot as any).weekly_trend?.startsWith('BEARISH'))) ? 'SHORT' : undefined);
+          const riskValidation = await validateGlobalSignal(supabase, symbol as string, snapshot, isManual, candidateSide);
           if (!riskValidation.valid) {
             console.log(`[Pre-AI Guard] [Trace: ${traceId}] REJECTED ${symbol}: ${riskValidation.reason}`);
             sendEvent({ type: "progress", message: `[Pre-AI Guard] Skipped ${symbol}: Exposure constraints violated.` });
@@ -1537,6 +1538,85 @@ serve(async (req) => {
               });
               rejections.push({ symbol: symbol as string, reason: discardReason, layer: "Deterministic Filter" });
               return;
+            }
+
+            // --- PRE-AI PRICE EXTENSION & ANTI-CHASING FILTER (Fibonacci Structure) ---
+            if (fib.swing_high && fib.swing_low && fib.swing_range > 0 && currentPrice > 0) {
+              const isBullish = fib.direction === "BULLISH_RETRACEMENT";
+              const swingOrigin = isBullish ? fib.swing_low : fib.swing_high;
+              const swingTarget = isBullish ? fib.swing_high : fib.swing_low;
+              const progress = isBullish
+                ? (currentPrice - swingOrigin) / fib.swing_range
+                : (swingOrigin - currentPrice) / fib.swing_range;
+
+              // Check proximity to Golden Pocket (50% or 61.8% Fib within 0.75%)
+              const nearGoldenPocket = nearestFibs.some((f) => 
+                (f.label.includes("50.0%") || f.label.includes("61.8%") || f.label.includes("38.2%")) &&
+                (f.distance / currentPrice) <= 0.0075
+              );
+              const hasSRConfirmation = Boolean(snapshot.sr_flip && (snapshot.sr_flip as any).holding_confirmed);
+
+              if (progress > 0.40 && !nearGoldenPocket && !hasSRConfirmation) {
+                const rejectReason = `Zero-Token Pre-Filter: Swing setup is extended (${(progress * 100).toFixed(0)}% progression from swing origin $${swingOrigin.toLocaleString()} toward target $${swingTarget.toLocaleString()}). Anti-chasing filter requires pullback into Golden Pocket discount before entry. LLM skipped.`;
+                console.log(`[Deterministic Filter] Discarding ${symbol}: ${rejectReason}`);
+                sendEvent({ type: 'progress', message: `[Deterministic Filter] ${symbol}: Extended (${(progress * 100).toFixed(0)}% of swing span). Skipped LLM.` });
+                await insertAuditLog(supabase, {
+                  actor_type: "SYSTEM",
+                  action: "REJECTED_BY_DETERMINISTIC_FILTER",
+                  entity_type: "research",
+                  payload_json: { symbol, reason: rejectReason },
+                });
+                rejections.push({ symbol: symbol as string, reason: rejectReason, layer: "Deterministic Filter" });
+                return;
+              }
+            }
+
+            // --- PRE-AI GEOMETRIC RISK:REWARD HARD GATE & ACCOUNT STOP BOUNDS ---
+            if (currentPrice > 0 && fib.swing_low && fib.swing_high) {
+              const isBullish = fib.direction === "BULLISH_RETRACEMENT";
+              const candidateSl = isBullish
+                ? (snapshot.safe_long_stop_loss || fib.swing_low)
+                : (snapshot.safe_short_stop_loss || fib.swing_high);
+
+              // Account-Aware Dynamic Maximum Stop Bounds (2.0% equity cap at 0.01 lot)
+              const stopBoundCheck = validateAccountStopBounds(symbol as string, currentPrice, candidateSl, 1020.0);
+              if (!stopBoundCheck.valid) {
+                console.log(`[Deterministic Filter] Discarding ${symbol}: ${stopBoundCheck.reason}`);
+                sendEvent({ type: 'progress', message: `[Deterministic Filter] ${symbol}: Stop exceeds 2% account equity cap. Skipped LLM.` });
+                await insertAuditLog(supabase, {
+                  actor_type: "SYSTEM",
+                  action: "REJECTED_BY_DETERMINISTIC_FILTER",
+                  entity_type: "research",
+                  payload_json: { symbol, reason: stopBoundCheck.reason },
+                });
+                rejections.push({ symbol: symbol as string, reason: stopBoundCheck.reason || "Account stop bound exceeded", layer: "Deterministic Filter" });
+                return;
+              }
+
+              // Check candidate R:R against first Fibonacci extension or swing extreme
+              const candidateTarget = isBullish
+                ? (fib.extensions?.[0]?.price || fib.swing_high)
+                : (fib.extensions?.[0]?.price || fib.swing_low);
+
+              const swingRisk = Math.abs(currentPrice - candidateSl);
+              const swingReward = isBullish ? (candidateTarget - currentPrice) : (currentPrice - candidateTarget);
+
+              if (swingRisk > 0 && swingReward > 0) {
+                const plannedRR = swingReward / swingRisk;
+                if (plannedRR < 1.75) {
+                  const rejectReason = `Zero-Token Pre-Filter: Structural R:R hurdle insufficient (1:${plannedRR.toFixed(2)} < 1:1.75 institutional floor). Invalidation distance (${swingRisk.toFixed(3)}) too wide for target (${swingReward.toFixed(3)}). LLM skipped.`;
+                  console.log(`[Deterministic Filter] Discarding ${symbol}: ${rejectReason}`);
+                  sendEvent({ type: 'progress', message: `[Deterministic Filter] ${symbol}: Structural R:R (1:${plannedRR.toFixed(2)}) < 1:1.75. Skipped LLM.` });
+                  await insertAuditLog(supabase, {
+                    actor_type: "SYSTEM",
+                    action: "REJECTED_BY_DETERMINISTIC_FILTER",
+                    entity_type: "research",
+                    payload_json: { symbol, reason: rejectReason },
+                  });
+                  rejections.push({ symbol: symbol as string, reason: rejectReason, layer: "Deterministic Filter" });
+                  return;
+                }
+              }
             }
           }
 
@@ -2217,6 +2297,30 @@ serve(async (req) => {
           }
           const finalSwingReward = tp2 ? Math.abs(tp2 - entry) : 0;
           const finalRrToTp2 = finalSwingRisk > 0 ? Number((finalSwingReward / finalSwingRisk).toFixed(2)) : rrToTp2;
+
+          // Final Account-Aware Dynamic Maximum Stop Bounds check (2.0% equity cap at 0.01 lot)
+          const finalStopBoundCheck = validateAccountStopBounds(symbol as string, entry, sl, 1020.0);
+          if (!finalStopBoundCheck.valid) {
+            console.log(`[Swing Execution Desk] REJECTED ${symbol}: ${finalStopBoundCheck.reason}`);
+            sendEvent({ type: "progress", message: `[${symbol as string}] REJECTED: Stop exceeds 2% account equity cap.` });
+            const rejectedObj = {
+              symbol: symbol as string,
+              side: dbSide,
+              timeframe: timeframe.toLowerCase(),
+              status: "REJECTED",
+              source: "agent-swing",
+              entry_plan_json: { price: entry, order_type, scaled_entries: null },
+              stop_plan_json: { stop: sl, initial: sl, atr: snapshot.atr_14 },
+              take_profit_json: { tp: tp2, tp1, tp2, tp3 },
+              ai_summary: `[SWING][${tier}] ${safeRationale}`,
+              ai_risks: finalStopBoundCheck.reason,
+              confidence: adjustedConfidence,
+              trace_id: traceId,
+            };
+            await supabase.from("trade_opportunities").insert(rejectedObj);
+            rejections.push({ symbol: symbol as string, reason: finalStopBoundCheck.reason || "Account stop bound exceeded", layer: "Execution Desk" });
+            return;
+          }
 
           // === APPROVED — SAVE TO DB ===
           const r = evaluation.swing_rationale;
