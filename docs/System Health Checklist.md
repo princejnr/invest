@@ -903,6 +903,51 @@ In `supabase/functions/agent-trade/index.ts` and `packages/strategy/agent-risk.t
 1. **Asset Lot Caps for Equities:** `assetLotCaps` in `agent-trade/index.ts` must explicitly cap US stocks (`AAPL`, `TSLA`, `NVDA`, `AMZN`, `MSFT`, `META`, `GOOGL`) to `0.02` lots per leg.
 2. **Equities Correlation Basket:** `correlationGroups` across `agent-trade`, `agent-swing`, and `agent-day` must include `["AAPL", "TSLA", "NVDA", "AMZN", "MSFT", "META", "GOOGL"]` to enforce a 0.5x risk modifier or veto contradictory directional exposure across US tech equities.
 
+## ⚠️ 2Q. Pre-Prompt Zero-Token Geometric Gate (R:R >= 1.75 Hurdle)
+
+> [!CAUTION]
+> **Incident (2026-09-10):** Signals were generated with structurally defective risk-reward geometry (e.g. `XAGUSD SHORT` with 0.56:1 R:R, and `UKOIL` with 0.61:1 R:R) where entries were located right above major structural support floors. The system incurred token costs calling OpenAI only to have the Execution Desk reject the setup post-hoc.
+
+### Standard Rule:
+In `agent-day/index.ts` and `agent-swing/index.ts`, candidate Entry, Stop Loss, and nearest opposing structural hurdles (S/R, Pivots, Channels, Fib extensions) are evaluated in pure TypeScript *before* calling the LLM:
+$$\text{Planned R:R} = \frac{|\text{Target Price} - \text{Entry Price}|}{|\text{Entry Price} - \text{Stop Price}|} \ge 1.75$$
+If the structural target headroom cannot mathematically deliver $\ge 1.75\text{ R:R}$ due to immediate opposing support/resistance, the candidate is deterministically discarded with `Zero-Token Pre-Filter: Structural R:R hurdle insufficient`, skipping the LLM entirely.
+
+---
+
+## ⚠️ 2R. Sibling Agent Consensus & Inter-Agent Conflict Shield (4-Hour Window)
+
+> [!CAUTION]
+> **Incident (2026-09-10):** Within 47 seconds at 17:54 UTC, `agent-day` generated `UKOIL SHORT` while `agent-swing` generated `UKOIL LONG`. Furthermore, `agent-swing` generated `SPX500 LONG` and `US30 SHORT` within 3 seconds of each other. Sibling agent cannibalization created conflicting directional exposure, paying double spread and fee friction while neutralizing portfolio edge.
+
+### Standard Rule:
+In `packages/strategy/agent-risk.ts` (`validateSiblingAgentConsensus`):
+1. **Exact Symbol Opposing Shield:** Scans `trade_opportunities` for active, queued, or approved signals on the same symbol within the last 4 hours. If an opposing direction signal exists, the candidate is rejected with `REJECTED: Sibling Agent Conflict Shield on <symbol>`.
+2. **Correlated Index & Energy Shield:** Cross-checks correlation baskets (`EQUITY_INDICES`, `ENERGY`). Proposing a `SHORT` on `US30` or `NAS100` when `SPX500` is active `LONG` is strictly rejected with `REJECTED: Sibling Agent Correlation Conflict Shield`.
+
+---
+
+## ⚠️ 2S. 2-Hour Symbol Generation Debounce & Anti-Burst Lockout
+
+> [!CAUTION]
+> **Incident (2026-09-10):** Between 17:54 and 18:46 UTC, 20 signals were generated in under an hour. `XAGUSD SHORT` was spammed 6 times within 38 minutes, flooding the review queues and consuming duplicate execution resources.
+
+### Standard Rule:
+In `packages/strategy/agent-risk.ts` (`validateSymbolGenerationDebounce`):
+Once an opportunity is generated for a symbol with status `APPROVED`, `PENDING_APPROVAL`, `ACTIVE`, or `QUEUED`, an automated **2-hour generation debounce** is enforced for that symbol across all agents. Subsequent signal generation runs skip the symbol until the active setup executes, invalidates, or passes the 2-hour window.
+
+---
+
+## ⚠️ 2T. Account-Aware Dynamic Maximum Stop Bounds (2.0% Equity Cap)
+
+> [!CAUTION]
+> **Incident (2026-09-10):** Signal #20 on `UKOIL` proposed a 447-point stop ($4.47 distance). With a 1,000 bbl contract size, the smallest allowable broker lot (0.01 lot) risked **$44.70**, representing **4.4%** of a $1,020 account. The execution desk was forced to reject the trade for breaching the 10% blowout cap.
+
+### Standard Rule:
+In `packages/strategy/agent-risk.ts` (`validateAccountStopBounds`), stop loss distances are bounded by master account equity:
+$$\text{Max Allowable Stop Distance} = \frac{\text{Capital} \times 0.02}{0.01 \times \text{PointValue}}$$
+For `UKOIL` (1,000 bbl contract, $10/point on 0.01 lot) on a $1,020 account, the stop distance is hard-capped at **$2.04 (204 points)**. Candidates requiring wider stops must either tighten into a discount entry or be discarded pre-AI.
+
 ---
 
 ## ⚠️ 3A. Trade Execution — Status Mismatch (Orphaned PENDING)

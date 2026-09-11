@@ -69,6 +69,14 @@ Technical setups maintain peak predictive power up to **20 periods**:
 ### 9. Bifurcated Contingent Alternative Scenario Auto-Execution
 Every analysis populates `market_context` with both the **Preferred Scenario** and the **Contingent Alternative Scenario**. If a trade experiences a confirmed candle close beyond the Pivot Point, [`agent-trade`](file:///Users/quagrained/workspace/raine/invest/supabase/functions/agent-trade) immediately closes the position and autonomously stages the inverted Alternative Scenario trade with zero execution lag.
 
+### 10. Multi-Agent Consensus & Sibling Conflict Shield
+To prevent multi-sleeve cross-desk cannibalization (e.g. `agent-day` shorting an asset while `agent-swing` buys it, or opposing concurrent bets on correlated equity indices like `US30` and `SPX500`), the council enforces:
+- **Sibling Agent Conflict Shield (4h Window):** No agent may generate an opposing directional setup on the same symbol or correlated asset cluster within 4 hours.
+- **2-Hour Symbol Generation Debounce:** Prevents burst flooding by locking an asset from repeated generation for 2 hours once an approved/pending setup is created.
+- **Zero-Token Pre-Prompt Geometric Gate:** Evaluates candidate entry, stop, and structural target hurdles in pure TypeScript. If mathematical $\text{R:R} < 1.75$, the setup is discarded immediately without calling the LLM.
+- **Price Extension / Anti-Chasing Filter:** Discards candidate setups if $>40\%$ of the projected impulse move has elapsed without a pullback into discount/premium.
+- **Account-Aware Dynamic Maximum Stop Bounds:** Caps stop loss distances to $2.0\%$ of equity at minimum broker lot (0.01 lot), protecting accounts from outsized asset contract sizes.
+
 ---
 
 ## The Agent Council Pipeline

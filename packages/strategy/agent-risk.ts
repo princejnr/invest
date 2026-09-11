@@ -54,17 +54,204 @@ const CURRENCY_DECOMPOSITION: Record<string, { base: string, quote: string }> = 
   ETHUSD: { base: 'ETH', quote: 'USD' },
 };
 
+export const ASSET_CONTRACT_SIZES: Record<string, number> = {
+  XAGUSD: 5000,
+  UKOIL: 1000,
+  USOIL: 1000,
+  XAUUSD: 100,
+  US30: 1,
+  NAS100: 1,
+  SPX500: 1,
+  GER30: 1,
+  BTCUSD: 1,
+  ETHUSD: 1,
+  EURUSD: 100000,
+  GBPUSD: 100000,
+  USDJPY: 100000,
+  AUDUSD: 100000,
+  NZDUSD: 100000,
+  USDCAD: 100000,
+  USDCHF: 100000,
+  EURJPY: 100000,
+  GBPJPY: 100000,
+};
+
+// Validates that stop loss distance on candidate trades does not exceed the 2.0% account blowout cap at 0.01 lot
+export function validateAccountStopBounds(
+  symbol: string,
+  entryPrice: number,
+  stopLoss: number,
+  portfolioCapital: number = 1020.0
+): RiskValidationResult {
+  const contractSize = ASSET_CONTRACT_SIZES[symbol] || 1;
+  const minLot = 0.01;
+  const maxRiskPct = 0.02; // 2.0% max loss per trade at minimum lot
+  const maxDollarLoss = portfolioCapital * maxRiskPct;
+
+  let pointValueUsd = contractSize;
+  if (symbol.endsWith("JPY") && entryPrice > 0) {
+    pointValueUsd = contractSize / entryPrice;
+  } else if (symbol === "GER30") {
+    pointValueUsd = contractSize * 1.1;
+  }
+
+  const stopDistance = Math.abs(entryPrice - stopLoss);
+  const minLotDollarRisk = stopDistance * minLot * pointValueUsd;
+
+  if (minLotDollarRisk > maxDollarLoss) {
+    const maxStopDist = maxDollarLoss / (minLot * pointValueUsd);
+    return {
+      valid: false,
+      reason: `REJECTED: Account-Aware Stop Bound exceeded on ${symbol}. Stop distance (${stopDistance.toFixed(3)}) risks $${minLotDollarRisk.toFixed(2)} at 0.01 lot, exceeding the 2.0% equity cap ($${maxDollarLoss.toFixed(2)} on $${portfolioCapital.toFixed(0)} capital). Maximum allowable stop distance is ${maxStopDist.toFixed(3)}.`
+    };
+  }
+
+  return { valid: true };
+}
+
+// 2-Hour Symbol Generation Debounce & Anti-Burst Lockout
+export async function validateSymbolGenerationDebounce(
+  supabase: SupabaseClient,
+  symbol: string,
+  debounceHours: number = 2
+): Promise<RiskValidationResult> {
+  const windowAgo = new Date(Date.now() - debounceHours * 60 * 60 * 1000).toISOString();
+  const { data: recentSignals, error } = await supabase
+    .from("trade_opportunities")
+    .select("id, symbol, side, created_at, status, source")
+    .eq("symbol", symbol)
+    .in("status", ["APPROVED", "PENDING_APPROVAL", "ACTIVE", "QUEUED"])
+    .eq("is_archived", false)
+    .gte("created_at", windowAgo)
+    .order("created_at", { ascending: false })
+    .limit(1);
+
+  if (error) {
+    console.warn(`[Debounce Guard] Error querying recent signals for ${symbol}: ${error.message}`);
+    return { valid: true };
+  }
+
+  if (recentSignals && recentSignals.length > 0) {
+    const prev = recentSignals[0];
+    return {
+      valid: false,
+      reason: `REJECTED: 2-Hour Symbol Debounce active for ${symbol}. Opportunity ${prev.id} (${prev.source || "agent"} ${prev.side}) was generated at ${prev.created_at} (${prev.status}). Anti-burst cooldown active.`
+    };
+  }
+
+  return { valid: true };
+}
+
+// Sibling Consensus & Inter-Agent Conflict Shield (4-Hour Window)
+export async function validateSiblingAgentConsensus(
+  supabase: SupabaseClient,
+  symbol: string,
+  proposedSide: string,
+  consensusWindowHours: number = 4
+): Promise<RiskValidationResult> {
+  if (!proposedSide || proposedSide === "NONE") return { valid: true };
+
+  const normProposed = (proposedSide.toUpperCase().includes("LONG") || proposedSide.toUpperCase().includes("BUY")) ? "LONG" : "SHORT";
+  const windowAgo = new Date(Date.now() - consensusWindowHours * 60 * 60 * 1000).toISOString();
+
+  const { data: recentSignals, error } = await supabase
+    .from("trade_opportunities")
+    .select("id, symbol, side, status, source, created_at")
+    .gte("created_at", windowAgo)
+    .in("status", ["APPROVED", "PENDING_APPROVAL", "ACTIVE", "QUEUED", "WON"])
+    .eq("is_archived", false);
+
+  if (error || !recentSignals) {
+    return { valid: true };
+  }
+
+  // 1. Exact Symbol Opposite Direction Shield
+  const directOpposites = recentSignals.filter(
+    (s: any) => s.symbol === symbol && s.side && (
+      (normProposed === "LONG" && (s.side === "SHORT" || s.side === "SELL")) ||
+      (normProposed === "SHORT" && (s.side === "LONG" || s.side === "BUY"))
+    )
+  );
+
+  if (directOpposites.length > 0) {
+    const opp = directOpposites[0];
+    return {
+      valid: false,
+      reason: `REJECTED: Sibling Agent Conflict Shield on ${symbol}. Active opposing signal ${opp.id} (${opp.source || "sibling agent"} ${opp.side}) was generated within ${consensusWindowHours}h (${opp.created_at}). Opposing directional signals forbidden.`
+    };
+  }
+
+  // 2. Correlated Group Opposite Direction Shield (Indices, Energy)
+  const currentGroup = CORRELATION_GROUPS[symbol];
+  if (currentGroup && (currentGroup.group === "EQUITY_INDICES" || currentGroup.group === "ENERGY")) {
+    const currentDirectionScore = (normProposed === "LONG" ? 1 : -1) * currentGroup.weight;
+    for (const s of recentSignals) {
+      if (s.symbol !== symbol) {
+        const peerGroup = CORRELATION_GROUPS[s.symbol];
+        if (peerGroup && peerGroup.group === currentGroup.group) {
+          const peerSideNorm = (s.side === "LONG" || s.side === "BUY") ? "LONG" : "SHORT";
+          const peerDirectionScore = (peerSideNorm === "LONG" ? 1 : -1) * peerGroup.weight;
+          if (currentDirectionScore * peerDirectionScore < 0) {
+            return {
+              valid: false,
+              reason: `REJECTED: Sibling Agent Correlation Conflict Shield. Opposing ${currentGroup.group} setup active (${s.symbol} ${s.side} from ${s.source || "sibling agent"}). Proposing ${symbol} ${normProposed} contradicts open basket exposure.`
+            };
+          }
+        }
+      }
+    }
+  }
+
+  return { valid: true };
+}
+
 // Validates if the central AI is allowed to generate a new signal for this asset
 export async function validateGlobalSignal(
   supabase: SupabaseClient,
   symbol: string,
   currentSnapshot?: LogicContext,
-  isManual: boolean = false
+  isManual: boolean = false,
+  proposedSide?: string
 ): Promise<RiskValidationResult> {
   if (isManual) {
     console.log(`[Risk Manager] Manual bypass engaged for ${symbol}. Skipping correlation and isolation guards.`);
     return { valid: true };
   }
+
+  // --- 2-HOUR SYMBOL GENERATION DEBOUNCE & ANTI-BURST LOCKOUT ---
+  const debounceCheck = await validateSymbolGenerationDebounce(supabase, symbol, 2);
+  if (!debounceCheck.valid) {
+    return debounceCheck;
+  }
+
+  // Determine candidate side for consensus and correlation validation
+  let assumedSide = proposedSide ? proposedSide.toUpperCase() : 'NONE';
+  if (assumedSide === 'NONE' && currentSnapshot) {
+    if (currentSnapshot.trend_alignment?.startsWith('BULLISH') || currentSnapshot.htf_trend === 'BULLISH') assumedSide = 'LONG';
+    else if (currentSnapshot.trend_alignment?.startsWith('BEARISH') || currentSnapshot.htf_trend === 'BEARISH') assumedSide = 'SHORT';
+  }
+
+  // --- SIBLING CONSENSUS & INTER-AGENT CONFLICT SHIELD (4-Hour Window) ---
+  if (assumedSide !== 'NONE') {
+    const consensusCheck = await validateSiblingAgentConsensus(supabase, symbol, assumedSide, 4);
+    if (!consensusCheck.valid) {
+      return consensusCheck;
+    }
+  }
+
+  // --- ACCOUNT-AWARE DYNAMIC MAXIMUM STOP BOUNDS (2.0% Equity Cap) ---
+  if (currentSnapshot?.current_price) {
+    const candidateSl = assumedSide === 'LONG'
+      ? (currentSnapshot.safe_long_stop_loss || currentSnapshot.recent_swing_low)
+      : (currentSnapshot.safe_short_stop_loss || currentSnapshot.recent_swing_high);
+    if (candidateSl) {
+      const stopBoundCheck = validateAccountStopBounds(symbol, currentSnapshot.current_price, candidateSl, 1020.0);
+      if (!stopBoundCheck.valid) {
+        return stopBoundCheck;
+      }
+    }
+  }
+
   // Fetch active and pending signals
   const { data: activeSignals, error: activeError } = await supabase
     .from("trade_opportunities")

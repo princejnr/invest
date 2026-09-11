@@ -6,7 +6,7 @@ import { insertAuditLog } from "../../../packages/core/audit.ts";
 import { isMarketOpen, isCrypto, isUsEquity, isAsianOrPacificAsset } from "../../../packages/core/market.ts";
 import { netEdge, transactionCost, slippage } from "../../../packages/strategy/index.ts";
 import { getContextSnapshot, LogicContext, calculatePivotPoints, computeLiquiditySweepScore, calculateInstitutionalTradingCentralLevels } from "../../../packages/strategy/indicators.ts";
-import { validateGlobalSignal, validateCentralBankIntervention } from "../../../packages/strategy/agent-risk.ts";
+import { validateGlobalSignal, validateCentralBankIntervention, validateAccountStopBounds, ASSET_CONTRACT_SIZES } from "../../../packages/strategy/agent-risk.ts";
 import { fetchAllMacroEvents, generateMacroContext, fetchRealtimeNews, detectCentralBankEvent, detectUpcomingFedEvent, computeMacroConfidenceBoost, fetchETFFlowSentiment } from "../../../packages/core/news.ts";
 import { isAutoTradingEnabled, getTradingSymbols } from "../../../packages/core/settings.ts";
 
@@ -1155,7 +1155,8 @@ serve(async (req) => {
             }
 
             sendEvent({ type: 'progress', message: `[Pre-AI Guard] Validating global signal constraints for ${symbol}...` });
-            const riskValidation = await validateGlobalSignal(supabase, symbol, snapshot, isManual);
+            const candidateSide = (snapshot.trend_alignment?.startsWith('BULLISH') || snapshot.htf_trend === 'BULLISH') ? 'LONG' : ((snapshot.trend_alignment?.startsWith('BEARISH') || snapshot.htf_trend === 'BEARISH') ? 'SHORT' : undefined);
+            const riskValidation = await validateGlobalSignal(supabase, symbol, snapshot, isManual, candidateSide);
             if (!riskValidation.valid) {
               console.log(`[Pre-AI Guard] REJECTED ${symbol}: ${riskValidation.reason}`);
               sendEvent({ type: 'progress', message: `[Pre-AI Guard] Skipped ${symbol}: Exposure constraints violated.` });
@@ -1428,6 +1429,118 @@ serve(async (req) => {
                   });
                   rejections.push({ symbol, reason: rejectReason, layer: "Deterministic Filter" });
                   return;
+                }
+              }
+
+              // Pre-AI Price Extension & Anti-Chasing Filter
+              // Institutional auction market theory dictates accumulating in discount (<50% equilibrium) and distributing in premium.
+              // Initiating setups after >40% of the impulse expansion toward target has elapsed results in chasing late momentum.
+              if (snapshot.current_price && snapshot.recent_swing_high && snapshot.recent_swing_low) {
+                const p = snapshot.current_price;
+                const isBullish = snapshot.trend_alignment.startsWith("BULLISH") || snapshot.htf_trend === "BULLISH";
+                const isBearish = snapshot.trend_alignment.startsWith("BEARISH") || snapshot.htf_trend === "BEARISH";
+                
+                if (isBullish && snapshot.recent_swing_high > snapshot.recent_swing_low) {
+                  const swingOrigin = snapshot.recent_swing_low;
+                  const swingTarget = snapshot.recent_swing_high;
+                  const swingSpan = swingTarget - swingOrigin;
+                  const progress = (p - swingOrigin) / swingSpan;
+                  
+                  const inDiscountPullback = Boolean(
+                    (snapshot.bullish_fvg_50pct && Math.abs(p - snapshot.bullish_fvg_50pct) / p <= 0.003) ||
+                    (snapshot.sr_flip && (snapshot.sr_flip as any).holding_confirmed)
+                  );
+                  if (progress > 0.40 && !inDiscountPullback) {
+                    const rejectReason = `Zero-Token Pre-Filter: Setup is extended (${(progress * 100).toFixed(0)}% progression from swing low $${swingOrigin} to high $${swingTarget}). Anti-chasing filter requires pullback into discount before entry. LLM skipped.`;
+                    console.log(`[Deterministic Filter] Discarding ${symbol}: ${rejectReason}`);
+                    sendEvent({ type: 'progress', message: `[Deterministic Filter] ${symbol}: Extended (${(progress * 100).toFixed(0)}% to target). Skipped LLM.` });
+                    await insertAuditLog(supabase, {
+                      actor_type: "SYSTEM",
+                      action: "REJECTED_BY_DETERMINISTIC_FILTER",
+                      entity_type: "research",
+                      payload_json: { symbol, reason: rejectReason },
+                    });
+                    rejections.push({ symbol, reason: rejectReason, layer: "Deterministic Filter" });
+                    return;
+                  }
+                } else if (isBearish && snapshot.recent_swing_high > snapshot.recent_swing_low) {
+                  const swingOrigin = snapshot.recent_swing_high;
+                  const swingTarget = snapshot.recent_swing_low;
+                  const swingSpan = swingOrigin - swingTarget;
+                  const progress = (swingOrigin - p) / swingSpan;
+
+                  const inPremiumPullback = Boolean(
+                    (snapshot.bearish_fvg_50pct && Math.abs(p - snapshot.bearish_fvg_50pct) / p <= 0.003) ||
+                    (snapshot.sr_flip && (snapshot.sr_flip as any).holding_confirmed)
+                  );
+                  if (progress > 0.40 && !inPremiumPullback) {
+                    const rejectReason = `Zero-Token Pre-Filter: Setup is extended (${(progress * 100).toFixed(0)}% progression from swing high $${swingOrigin} to low $${swingTarget}). Anti-chasing filter requires pullback into premium before short entry. LLM skipped.`;
+                    console.log(`[Deterministic Filter] Discarding ${symbol}: ${rejectReason}`);
+                    sendEvent({ type: 'progress', message: `[Deterministic Filter] ${symbol}: Extended (${(progress * 100).toFixed(0)}% to target). Skipped LLM.` });
+                    await insertAuditLog(supabase, {
+                      actor_type: "SYSTEM",
+                      action: "REJECTED_BY_DETERMINISTIC_FILTER",
+                      entity_type: "research",
+                      payload_json: { symbol, reason: rejectReason },
+                    });
+                    rejections.push({ symbol, reason: rejectReason, layer: "Deterministic Filter" });
+                    return;
+                  }
+                }
+              }
+
+              // Pre-AI Geometric Risk:Reward Hard Gate (1:1.75 Minimum Floor)
+              // Pure TypeScript calculation before calling LLM. Eliminates sub-1.0 R:R anomalies (like 0.56:1 or 0.65:1).
+              if (snapshot.current_price) {
+                const p = snapshot.current_price;
+                const isBullish = snapshot.trend_alignment.startsWith("BULLISH") || snapshot.htf_trend === "BULLISH";
+                const isBearish = snapshot.trend_alignment.startsWith("BEARISH") || snapshot.htf_trend === "BEARISH";
+                const atr = snapshot.atr_14 || (p * 0.005);
+
+                const candidateEntry = p;
+                const candidateSl = isBullish
+                  ? (snapshot.safe_long_stop_loss || (snapshot.recent_swing_low ? snapshot.recent_swing_low - 0.25 * atr : p - 1.25 * atr))
+                  : (snapshot.safe_short_stop_loss || (snapshot.recent_swing_high ? snapshot.recent_swing_high + 0.25 * atr : p + 1.25 * atr));
+
+                // Check Account-Aware Stop Bound (Max 2.0% equity at 0.01 lot)
+                const stopBoundCheck = validateAccountStopBounds(symbol, candidateEntry, candidateSl, 1020.0);
+                if (!stopBoundCheck.valid) {
+                  console.log(`[Deterministic Filter] Discarding ${symbol}: ${stopBoundCheck.reason}`);
+                  sendEvent({ type: 'progress', message: `[Deterministic Filter] ${symbol}: Stop exceeds 2% account equity cap. Skipped LLM.` });
+                  await insertAuditLog(supabase, {
+                    actor_type: "SYSTEM",
+                    action: "REJECTED_BY_DETERMINISTIC_FILTER",
+                    entity_type: "research",
+                    payload_json: { symbol, reason: stopBoundCheck.reason },
+                  });
+                  rejections.push({ symbol, reason: stopBoundCheck.reason || "Account stop bound exceeded", layer: "Deterministic Filter" });
+                  return;
+                }
+
+                // Check immediate opposing structural boundary / target ceiling
+                const candidateTarget = isBullish
+                  ? (snapshot.htf_resistance?.[0] || snapshot.trend_channel?.upper_line || (snapshot.htf_pivot && snapshot.htf_pivot > p ? snapshot.htf_pivot : null))
+                  : (snapshot.htf_support?.[0] || snapshot.trend_channel?.lower_line || (snapshot.htf_pivot && snapshot.htf_pivot < p ? snapshot.htf_pivot : null));
+
+                if (candidateTarget && candidateSl) {
+                  const riskDist = Math.abs(candidateEntry - candidateSl);
+                  const rewardDist = isBullish ? (candidateTarget - candidateEntry) : (candidateEntry - candidateTarget);
+                  if (rewardDist > 0 && riskDist > 0) {
+                    const plannedRR = rewardDist / riskDist;
+                    if (plannedRR < 1.75) {
+                      const rejectReason = `Zero-Token Pre-Filter: Structural R:R hurdle insufficient (1:${plannedRR.toFixed(2)} < 1:1.75 institutional floor). Immediate opposing hurdle at $${candidateTarget.toFixed(3)} suffocates target headroom. LLM skipped.`;
+                      console.log(`[Deterministic Filter] Discarding ${symbol}: ${rejectReason}`);
+                      sendEvent({ type: 'progress', message: `[Deterministic Filter] ${symbol}: Structural R:R (1:${plannedRR.toFixed(2)}) < 1:1.75. Skipped LLM.` });
+                      await insertAuditLog(supabase, {
+                        actor_type: "SYSTEM",
+                        action: "REJECTED_BY_DETERMINISTIC_FILTER",
+                        entity_type: "research",
+                        payload_json: { symbol, reason: rejectReason },
+                      });
+                      rejections.push({ symbol, reason: rejectReason, layer: "Deterministic Filter" });
+                      return;
+                    }
+                  }
                 }
               }
             }
