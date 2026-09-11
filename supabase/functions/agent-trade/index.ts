@@ -1977,7 +1977,9 @@ for (const [orderId, trade] of orderMap) {
     // === EXECUTION GUARD: DYNAMIC ATR STOP LOSS FLOOR ===
     // Prevent stop losses that are too tight to survive market noise.
     // For Swing Trades, enforce floor against 1.25x Daily ATR rather than 30m ATR.
-    if (!isManual && defaultEntryPrice && stopLoss) {
+    // Note: Bypassed for Limit Orders since pullback entry is intentionally positioned close to structural invalidation.
+    const isLimitOrder = (signal.entry_plan_json?.order_type || "").toUpperCase().includes("LIMIT");
+    if (!isManual && !isLimitOrder && defaultEntryPrice && stopLoss) {
       try {
         const tfForAtr = isSwingTrade ? "1D" : "30m";
         const minAtrMultiplier = isSwingTrade ? 1.25 : 1.0;
@@ -2257,6 +2259,7 @@ for (const [orderId, trade] of orderMap) {
       .from("user_trades")
       .select("id, opportunity_id, status, created_at, risk_amount")
       .eq("symbol", signal.symbol)
+      .neq("opportunity_id", signal.id)
       .in("status", ["OPEN", "PENDING", "VPS_PENDING", "VPS_PROCESSING"]);
 
     if (existingActiveTrades && existingActiveTrades.length > 0) {
@@ -2427,6 +2430,7 @@ for (const [orderId, trade] of orderMap) {
         .from("user_trades")
         .select("id")
         .eq("symbol", signal.symbol)
+        .neq("opportunity_id", signal.id)
         .in("status", ["OPEN", "VPS_PENDING", "VPS_PROCESSING"]);
       
       if (existingOpenTrades && existingOpenTrades.length > 0) {
@@ -2675,7 +2679,7 @@ for (const [orderId, trade] of orderMap) {
       }
 
       for (const user of users) {
-        if (isManual && payload.user_id !== user.user_id) continue;
+        if (isManual && payload.user_id && payload.user_id !== user.user_id) continue;
 
         let tierRiskModifier = 1.0;
         if (signalTier === "B-Tier") tierRiskModifier = 0.5;

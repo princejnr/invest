@@ -532,6 +532,11 @@ serve(async (req) => {
     }
 
     // 4K. Pending Approval Opportunities Backlog Audit & Live Conflict Guard
+    const { data: activeLiveTrades } = await supabase
+      .from("user_trades")
+      .select("symbol, side, status")
+      .in("status", ["OPEN", "PENDING", "VPS_PENDING", "VPS_PROCESSING"]);
+
     let pendingApprovalCount = 0;
     const { data: pendingApprovalOpps } = await supabase
       .from("trade_opportunities")
@@ -541,12 +546,6 @@ serve(async (req) => {
 
     if (pendingApprovalOpps && pendingApprovalOpps.length > 0) {
       pendingApprovalCount = pendingApprovalOpps.length;
-
-      // Check active open positions in user_trades
-      const { data: activeLiveTrades } = await supabase
-        .from("user_trades")
-        .select("symbol, side, status")
-        .in("status", ["OPEN", "PENDING", "VPS_PENDING", "VPS_PROCESSING"]);
 
       const activePositionsBySymbol: Record<string, string[]> = {};
       if (activeLiveTrades && activeLiveTrades.length > 0) {
