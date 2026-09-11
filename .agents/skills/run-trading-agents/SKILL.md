@@ -275,3 +275,19 @@ When an asset fails to achieve S-Tier confidence (e.g. confidence < 75 due to mi
       * **Programmatic Limit Guard (`isUnfilledLimit`)**: If a limit order has not yet been filled (`currentPrice > entryPrice` for LONG, or `currentPrice < entryPrice` for SHORT), any AI-generated `TAKE_PROFIT` or `TIGHTEN_STOP` is intercepted and overridden to `MAINTAIN`.
       * **Timeframe Scoping**: `agent-swing` strictly revalidates daily swing signals (`1d`), preventing cross-agent interference with intraday scalps.
       * **Profit Securing Status Mapping**: Legitimate early profit securing on filled active positions updates `status: "WON"`, never `"REJECTED"`, preserving transparency in dashboard metrics.
+21. **The 5 Institutional Signal Quality Guards (`agent-risk.ts`)**:
+    - **2-Hour Debounce / Rate Limiter**: Bypassed for distinct timeframes (e.g., M30 scalps vs 1D swings) or opposite direction reversals, but blocks rapid duplicate signal churn on the same asset.
+    - **Sibling Consensus Shield**: Blocks concurrent unhedged stacking or contradictory signals on correlated assets (e.g., index stacking between `SPX500` and `US30`).
+    - **Zero-Token Geometric Hard Gate**: Validates mathematical orientation before LLM generation (SL < Entry < TP for Long, SL > Entry > TP for Short) to save latency and token costs.
+    - **Price Extension Filter**: Prevents chasing trades when current spot has already extended $> 0.5\times\text{ATR}$ past the proposed entry price.
+    - **Account-Aware Stop Bounds Validation**: Dynamically verifies that stop distance $\times$ contract point value $\le 2.0\%$ of account equity ($20.40 on $1,020 capital at 0.01 lot), protecting the account from outsized tail risk on commodities with large contract multipliers.
+22. **Autonomous Pullback Limit Solver Pattern for Account Stop Bound Compliance**:
+    - When raw stop distance exceeds account equity risk cap, instead of an outright rejection with `Account-Aware Stop Bound exceeded`, the engine should autonomously solve for the limit entry price:
+      $$\text{Entry}_{\text{Long}} = \text{SL} + \text{MaxAllowableStopDistance}, \quad \text{Entry}_{\text{Short}} = \text{SL} - \text{MaxAllowableStopDistance}$$
+      Provided this limit price lies within an achievable pullback distance ($\le 0.75\times\text{ATR}$ of current price), the signal is converted to a high-conviction discount Limit Order with asymmetric R:R ($\ge 1:3.50$ to $1:5.00$), elevating the setup to institutional S-Tier status.
+23. **Pareto Asset Contract Economics & Profitability Ranking Matrix**:
+    - **`UKOIL` / `USOIL` ($10.00/pt per 0.01 lot)**: Highest dollar profitability per point. An S-Tier short limit on UKOIL risking $2.04 ($20.40) to make $10.82 ($108.17) yields an extraordinary **$EV = +\$76.03$** and **1:5.30 R:R**.
+    - **`ETHUSD` ($0.01/pt per 0.01 lot)**: High win rate and wide structural breathing room (Risk: $273.41 \implies \$2.73$ risk; Reward to TP2: $642.51 \implies \$6.43$ reward; $EV = +\$4.14$). Extremely safe swing, but modest dollar yield on micro lots.
+    - **`US30` ($0.01/pt per 0.01 lot on micro-CFD)**: High structural conviction (Double Top + RSI divergence). Risk: 1,155.44 pts ($11.55); Reward to TP2: 2,022.02 pts ($20.22); $EV = +\$12.28$ (R:R 1:1.75).
+    - **`XAGUSD` ($50.00/pt per 0.01 lot)**: Extreme dollar leverage per dollar move ($50/pt). Requires tight stops ($\le \$0.66$) to stay under capital caps.
+

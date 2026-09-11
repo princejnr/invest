@@ -390,8 +390,7 @@ export async function validateGlobalSignal(
   }
 
   // --- BASE/QUOTE CURRENCY EXPOSURE DECOMPOSITION & CONFLICT GUARD ---
-  let assumedSide = 'NONE';
-  if (currentSnapshot) {
+  if (assumedSide === 'NONE' && currentSnapshot) {
     if (currentSnapshot.trend_alignment?.startsWith('BULLISH')) assumedSide = 'LONG';
     else if (currentSnapshot.trend_alignment?.startsWith('BEARISH')) assumedSide = 'SHORT';
   }
