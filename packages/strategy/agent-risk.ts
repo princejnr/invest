@@ -155,21 +155,22 @@ export async function validateGlobalSignal(
     }
   }
 
-  // --- CONSECUTIVE STOP-LOSS COOLDOWN (Cascade & Knife-Catching Guard) ---
-  const fourHoursAgo = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();
+  // --- CONSECUTIVE STOP-LOSS COOLDOWN (12-Hour Anti-Revenge & Cascade Guard) ---
+  const twelveHoursAgo = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
   const { data: recentLosses } = await supabase
     .from("user_trades")
     .select("id, symbol, side, closed_at, status")
     .eq("symbol", symbol)
     .eq("status", "LOST")
-    .gte("closed_at", fourHoursAgo)
+    .gte("closed_at", twelveHoursAgo)
+    .order("closed_at", { ascending: false })
     .limit(1);
 
   if (recentLosses && recentLosses.length > 0) {
     const lastLoss = recentLosses[0];
     return {
       valid: false,
-      reason: `REJECTED: Stop-loss cooldown active for ${symbol}. Trade stopped out within the last 4 hours (${lastLoss.closed_at}). Cooling down to prevent knife-catching.`,
+      reason: `REJECTED: 12-Hour Stop-loss cooldown active for ${symbol}. Trade stopped out within the last 12 hours (${lastLoss.closed_at}). Cooling down to prevent knife-catching and serial losses.`,
     };
   }
   // --------------------------------------------------------

@@ -2198,6 +2198,47 @@ for (const [orderId, trade] of orderMap) {
       }
     }
 
+    // === EXECUTION GUARD 2B: DYNAMIC ATR LIQUIDITY SWEEP BUFFER ON KEY LEVELS & PIVOTS ===
+    // Prevents retail stop-hunting on Trading Central pivot points by buffering stops by >= 0.50x ATR.
+    const tcLevels = signal.entry_plan_json?.trading_central_levels;
+    const pivotPoint = Number(tcLevels?.pivot_point || signal.stop_plan_json?.initial || 0);
+    const atrValue = Number(signal.stop_plan_json?.atr || 0);
+
+    if (pivotPoint > 0 && stopLoss && defaultEntryPrice) {
+      const isLong = signal.side === "LONG" || signal.side === "BUY";
+      const dynamicBuffer = atrValue > 0 ? (atrValue * 0.50) : (minDistances[signal.symbol] ? minDistances[signal.symbol] * 0.75 : 0.0015);
+      const minLevelBuffer = minDistances[signal.symbol] ? minDistances[signal.symbol] * 0.50 : 0.0010;
+      const effectiveBuffer = Math.max(dynamicBuffer, minLevelBuffer);
+
+      if (isLong) {
+        const minSafeStop = Number((pivotPoint - effectiveBuffer).toFixed(5));
+        if (stopLoss > minSafeStop) {
+          console.warn(`[Pivot Liquidity Guard] Stop (${stopLoss}) is within liquidity sweep zone of pivot (${pivotPoint}). Buffering to ${minSafeStop} (-${effectiveBuffer.toFixed(5)}) to protect against false breakouts.`);
+          stopLoss = minSafeStop;
+          const updatedStopJson = {
+            ...signal.stop_plan_json,
+            stop: stopLoss,
+            stop_price: stopLoss
+          };
+          await supabase.from("trade_opportunities").update({ stop_plan_json: updatedStopJson }).eq("id", signal.id);
+          signal.stop_plan_json = updatedStopJson;
+        }
+      } else {
+        const minSafeStop = Number((pivotPoint + effectiveBuffer).toFixed(5));
+        if (stopLoss < minSafeStop) {
+          console.warn(`[Pivot Liquidity Guard] Stop (${stopLoss}) is within liquidity sweep zone of pivot (${pivotPoint}). Buffering to ${minSafeStop} (+${effectiveBuffer.toFixed(5)}) to protect against false breakouts.`);
+          stopLoss = minSafeStop;
+          const updatedStopJson = {
+            ...signal.stop_plan_json,
+            stop: stopLoss,
+            stop_price: stopLoss
+          };
+          await supabase.from("trade_opportunities").update({ stop_plan_json: updatedStopJson }).eq("id", signal.id);
+          signal.stop_plan_json = updatedStopJson;
+        }
+      }
+    }
+
     // --- MARKET HOURS PRE-FLIGHT CHECK (Universal Broker Guard) ---
     if (!isMarketOpen(signal.symbol)) {
       const rejectReason = `Rejected by Execution Desk: Market is closed for ${signal.symbol}.`;
@@ -2211,15 +2252,31 @@ for (const [orderId, trade] of orderMap) {
       return new Response(JSON.stringify({ success: true, message: `Rejected: Market closed for ${signal.symbol}` }), { status: 200 });
     }
 
-    // --- SYMBOL EXPOSURE & CONCURRENCY GUARD (Preventing Code:10019 Margin Exhaustion) ---
-    if (!isManual) {
-      const { data: existingActiveTrades } = await supabase
-        .from("user_trades")
-        .select("id, opportunity_id, status")
-        .eq("symbol", signal.symbol)
-        .in("status", ["OPEN", "PENDING", "VPS_PENDING", "VPS_PROCESSING"]);
+    // --- SYMBOL EXPOSURE & IDEMPOTENCY BURST GUARD ---
+    const { data: existingActiveTrades } = await supabase
+      .from("user_trades")
+      .select("id, opportunity_id, status, created_at, risk_amount")
+      .eq("symbol", signal.symbol)
+      .in("status", ["OPEN", "PENDING", "VPS_PENDING", "VPS_PROCESSING"]);
 
-      if (existingActiveTrades && existingActiveTrades.length > 0) {
+    if (existingActiveTrades && existingActiveTrades.length > 0) {
+      // 1. Idempotency Lock: If ANY trade for this symbol was dispatched within the last 2 minutes, block duplicate burst firing
+      const twoMinsAgo = Date.now() - 2 * 60 * 1000;
+      const hasRecentFiring = existingActiveTrades.some((t: any) => new Date(t.created_at).getTime() >= twoMinsAgo);
+      if (hasRecentFiring) {
+        const rejectReason = `Rejected by Execution Desk: Execution Idempotency Lock. A trade for ${signal.symbol} was dispatched <2m ago. Blocking duplicate burst firing.`;
+        await supabase.from("trade_opportunities").update({ 
+          status: "REJECTED", 
+          ai_summary: (signal.ai_summary || "") + "\n\n[Execution Desk] " + rejectReason, 
+          ai_risks: rejectReason,
+          closed_at: new Date().toISOString()
+        }).eq("id", signal.id);
+        console.log(`[Execution Desk] ${rejectReason}`);
+        return new Response(JSON.stringify({ success: true, message: rejectReason }), { status: 200 });
+      }
+
+      // 2. Distinct Opportunity Lock (if automated)
+      if (!isManual) {
         const distinctOpp = existingActiveTrades.some((t: any) => t.opportunity_id !== signal.id);
         if (distinctOpp) {
           const rejectReason = `Rejected by Execution Desk: Active position already exists for ${signal.symbol} (${existingActiveTrades.length} open legs). Preventing duplicate margin exposure.`;
@@ -2233,6 +2290,45 @@ for (const [orderId, trade] of orderMap) {
           return new Response(JSON.stringify({ success: true, message: rejectReason }), { status: 200 });
         }
       }
+
+      // 3. Single-Asset Maximum Committed Risk Cap (Max 2.0% of portfolio across all active legs)
+      const totalCommittedRiskOnSym = existingActiveTrades.reduce((sum: number, t: any) => sum + Number(t.risk_amount || 0), 0);
+      if (totalCommittedRiskOnSym >= 20.0) {
+        const rejectReason = `Rejected by Execution Desk: Single-Asset Risk Budget Saturated. Active committed risk on ${signal.symbol} is $${totalCommittedRiskOnSym.toFixed(2)} (Cap: $20.00 / 2.0%). Additional risk blocked.`;
+        await supabase.from("trade_opportunities").update({ 
+          status: "REJECTED", 
+          ai_summary: (signal.ai_summary || "") + "\n\n[Execution Desk] " + rejectReason, 
+          ai_risks: rejectReason,
+          closed_at: new Date().toISOString()
+        }).eq("id", signal.id);
+        console.log(`[Execution Desk] ${rejectReason}`);
+        return new Response(JSON.stringify({ success: true, message: rejectReason }), { status: 200 });
+      }
+    }
+
+    // --- 12-HOUR ASSET STOP-LOSS COOLDOWN GUARD (Anti-Revenge & Cascade Invalidation) ---
+    const twelveHoursAgo = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
+    const { data: recentLosses } = await supabase
+      .from("user_trades")
+      .select("id, symbol, side, closed_at, status")
+      .eq("symbol", signal.symbol)
+      .eq("side", signal.side)
+      .eq("status", "LOST")
+      .gte("closed_at", twelveHoursAgo)
+      .order("closed_at", { ascending: false })
+      .limit(1);
+
+    if (recentLosses && recentLosses.length > 0) {
+      const lastLoss = recentLosses[0];
+      const rejectReason = `Rejected by Execution Desk: 12-Hour Stop-Loss Cooldown Active for ${signal.symbol} ${signal.side}. Previous trade stopped out in loss at ${lastLoss.closed_at}. Cooling down to prevent serial re-entry drag.`;
+      await supabase.from("trade_opportunities").update({ 
+        status: "REJECTED", 
+        ai_summary: (signal.ai_summary || "") + "\n\n[Execution Desk] " + rejectReason, 
+        ai_risks: rejectReason,
+        closed_at: new Date().toISOString()
+      }).eq("id", signal.id);
+      console.log(`[Execution Desk] ${rejectReason}`);
+      return new Response(JSON.stringify({ success: true, message: rejectReason }), { status: 200 });
     }
 
     // --- VELOCITY / FLASH-FILL LOCKOUT GUARD ---
@@ -2317,8 +2413,8 @@ for (const [orderId, trade] of orderMap) {
         }
 
         if (alignedCount > 0 && opposingCount === 0) {
-          confluenceMultiplier = 3.0; // Bump risk to 3x for a conviction play
-          pmReason = "Portfolio Manager: 3.0x Risk Multiplier (Massive Multi-Agent Confluence Detected within 4H)";
+          confluenceMultiplier = 1.25; // Sane institutional cap: max 1.25x for conviction play (never 3x!)
+          pmReason = "Portfolio Manager: 1.25x Risk Multiplier (Multi-Agent Confluence Detected within 4H)";
         } else if (opposingCount > 0 && opposingCount >= alignedCount) {
           confluenceMultiplier = 0.5;
           pmReason = "Portfolio Manager: 0.5x Risk Multiplier (Counter-Trend Scalp / Opposing Confluence)";
@@ -2326,18 +2422,82 @@ for (const [orderId, trade] of orderMap) {
       }
 
       // --- DUPLICATE ASSET LOCK ---
-      // Prevents stacking multiple trades for the exact same asset if one is already open.
+      // Prevents stacking multiple trades for the exact same asset if one is already open or pending.
       const { data: existingOpenTrades } = await supabase
         .from("user_trades")
         .select("id")
         .eq("symbol", signal.symbol)
-        .eq("status", "OPEN");
+        .in("status", ["OPEN", "VPS_PENDING", "VPS_PROCESSING"]);
       
       if (existingOpenTrades && existingOpenTrades.length > 0) {
-        const rejectReason = `Rejected by Execution Desk: Duplicate lock. An open position already exists for ${signal.symbol}.`;
+        const rejectReason = `Rejected by Execution Desk: Duplicate lock. An open or pending position already exists for ${signal.symbol}.`;
         await supabase.from("trade_opportunities").update({ status: "REJECTED", ai_summary: signal.ai_summary + "\n\n[Execution Desk] " + rejectReason, ai_risks: rejectReason }).eq("id", signal.id);
         console.log(`[Execution Desk] Rejected ${signal.symbol} due to existing open trade (Duplicate Lock).`);
         return new Response(JSON.stringify({ success: true, message: "Rejected due to duplicate lock" }), { status: 200 });
+      }
+
+      // --- MACRO FACTOR / USD CURRENCY BASKET BUDGETING (CTA Industry Standard) ---
+      const USD_BASKET_WEIGHTS: Record<string, number> = {
+        EURUSD: -1, GBPUSD: -1, AUDUSD: -1, NZDUSD: -1,
+        XAUUSD: -1, XAGUSD: -1, BTCUSD: -1,
+        USDJPY: 1, USDCHF: 1, USDCAD: 1
+      };
+
+      const candUsdWeight = USD_BASKET_WEIGHTS[signal.symbol];
+      if (candUsdWeight !== undefined) {
+        const { data: allActiveTrades } = await supabase
+          .from("user_trades")
+          .select("symbol, side, risk_amount, opportunity_id")
+          .in("status", ["OPEN", "PENDING", "VPS_PENDING", "VPS_PROCESSING"]);
+
+        // Group risk by opportunity_id to avoid double counting split legs
+        const oppRisks: Record<string, { symbol: string, side: string, risk: number }> = {};
+        for (const ot of (allActiveTrades || [])) {
+          const key = ot.opportunity_id || ot.symbol;
+          if (!oppRisks[key]) {
+            oppRisks[key] = { symbol: ot.symbol, side: ot.side, risk: 0 };
+          }
+          oppRisks[key].risk += Number(ot.risk_amount || 0);
+        }
+
+        let netUsdDeltaRisk = 0;
+        for (const item of Object.values(oppRisks)) {
+          const weight = USD_BASKET_WEIGHTS[item.symbol];
+          if (weight !== undefined) {
+            const isLong = item.side === "LONG" || item.side === "BUY";
+            const dir = isLong ? 1 : -1;
+            const usdDir = dir * weight; // +1 = Long USD, -1 = Short USD
+            netUsdDeltaRisk += usdDir * item.risk;
+          }
+        }
+
+        const candIsLong = signal.side === "LONG" || signal.side === "BUY";
+        const candDir = candIsLong ? 1 : -1;
+        const candUsdDir = candDir * candUsdWeight; // +1 = Long USD, -1 = Short USD
+
+        // Master capital and max USD budget (2.0% of capital, e.g. $20.42 on $1021)
+        const { data: masterRec } = await supabase
+          .from("user_risk_settings")
+          .select("portfolio_capital")
+          .eq("is_master_account", true)
+          .maybeSingle();
+
+        const masterCapital = Number(masterRec?.portfolio_capital || 1000.0);
+        const maxUsdRiskBudget = masterCapital * 0.020;
+
+        // If proposed trade pushes in the same direction as saturated exposure:
+        if (candUsdDir * netUsdDeltaRisk > 0 && Math.abs(netUsdDeltaRisk) >= maxUsdRiskBudget) {
+          const dirText = netUsdDeltaRisk > 0 ? "LONG USD" : "SHORT USD";
+          const rejectReason = `Rejected by Execution Desk: Correlated USD Factor Risk Saturated. Portfolio already has ${dirText} net exposure of $${Math.abs(netUsdDeltaRisk).toFixed(2)} (Cap: $${maxUsdRiskBudget.toFixed(2)} / 2.0%). Additional correlated USD risk is blocked.`;
+          await supabase.from("trade_opportunities").update({ 
+            status: "REJECTED", 
+            ai_summary: (signal.ai_summary || "") + "\n\n[Execution Desk] " + rejectReason, 
+            ai_risks: rejectReason,
+            closed_at: new Date().toISOString()
+          }).eq("id", signal.id);
+          console.log(`[Execution Desk] ${rejectReason}`);
+          return new Response(JSON.stringify({ success: true, message: rejectReason }), { status: 200 });
+        }
       }
 
       // --- DYNAMIC CORRELATION LIMITS ---
@@ -2358,7 +2518,7 @@ for (const [orderId, trade] of orderMap) {
           .from("user_trades")
           .select("side, symbol")
           .in("symbol", otherSymbolsInGroup)
-          .eq("status", "OPEN");
+          .in("status", ["OPEN", "VPS_PENDING", "VPS_PROCESSING"]);
 
         if (openCorrelatedTrades && openCorrelatedTrades.length > 0) {
            let sameDirectionCount = 0;

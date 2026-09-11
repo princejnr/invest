@@ -599,6 +599,55 @@ CHECK ((status = ANY (ARRAY['PENDING_APPROVAL', 'PUBLISHED', 'ACTIVE', 'EXECUTED
 
 ---
 
+## ⚠️ 1V. Macro Factor & USD Currency Basket Net Exposure Budgeting (CTA Standard)
+
+> [!CAUTION]
+> **Incident (2026-09-10 / 2026-09-11):** 12 out of 14 losses were caused by an unhedged 4x directional concentration in the US Dollar (concurrent Longs in `EURUSD`, `GBPUSD`, `NZDUSD` and Short `USDCHF`). When the Dollar rallied, all positions collapsed simultaneously, losing -$85.71.
+
+### Standard Rule:
+1. **Net Factor Decomposition:** All USD-quoted assets (`EURUSD`, `GBPUSD`, `AUDUSD`, `NZDUSD`, `XAUUSD`, `XAGUSD`, `BTCUSD` with weight -1, and `USDJPY`, `USDCHF`, `USDCAD` with weight +1) belong to the **USD Factor Basket**.
+2. **Strict Risk Cap:** `agent-trade` and `agent-risk.ts` enforce that net directional USD exposure cannot exceed **2.0% of portfolio capital** ($20.42 on a $1,021 account) or a net of 2 concurrent directional legs.
+3. If net USD exposure is saturated, any candidate signal proposing to increase risk in that same direction is rejected with:
+   `Rejected by Execution Desk: Correlated USD Factor Risk Saturated. Portfolio already has <DIRECTION> net exposure (Cap: 2.0%).`
+
+---
+
+## ⚠️ 1W. Dynamic ATR Liquidity Sweep Buffers on Key Levels & Pivots
+
+> [!WARNING]
+> **Incident (2026-09-09 / 2026-09-10):** Trading Central signals set stops 0.3 to 3 pips below the pivot point (`stop: 1.34935` vs `pivot: 1.34965`). Normal market volatility and institutional liquidity sweeps routinely pierced the pivot by 5–10 pips before reversing, resulting in premature stopouts right at key turning points.
+
+### Standard Rule:
+1. When a signal references a key level or pivot point (`trading_central_levels.pivot_point` or `initial`), the stop loss MUST be buffered beyond the retail sweep zone:
+   $$\text{Stop}_{\text{LONG}} = \text{Pivot} - \max(0.50 \times \text{ATR}_{14}, \text{MinBuffer})$$
+   $$\text{Stop}_{\text{SHORT}} = \text{Pivot} + \max(0.50 \times \text{ATR}_{14}, \text{MinBuffer})$$
+2. `agent-trade` dynamically widens the stop and proportionally recalculates volume so total dollar risk remains strictly within the 1% target budget.
+
+---
+
+## ⚠️ 1X. 12-Hour Asset Stop-Loss Cooldown (Anti-Revenge & Cascade Invalidation)
+
+> [!CAUTION]
+> **Incident (2026-09-09 / 2026-09-10):** Three consecutive `GBPUSD LONG` setups were executed within 34 hours following stopouts during a markdown regime. The serial re-entries generated **-$40.22** in cumulative losses.
+
+### Standard Rule:
+1. When a position stops out with status `LOST`, `agent-trade` and `agent-risk.ts` enforce a mandatory **12-hour cooldown period** for that asset in the same direction.
+2. Candidate signals during this cooldown are automatically rejected with:
+   `Rejected by Execution Desk: 12-Hour Stop-Loss Cooldown Active for <SYMBOL> <SIDE>. Previous trade stopped out in loss. Cooling down to prevent serial re-entry drag.`
+
+---
+
+## ⚠️ 1Y. Stale Trade Lifecycle & Alpha Decay Management
+
+> [!TIP]
+> **Incident (2026-09-11):** `ETHUSD` positions floated for 130 hours (5.4 days) despite having a planned holding horizon of 8–10 hours and being marked `Superseded by fresh AI signal`.
+
+### Standard Rule:
+1. **Alpha Decay Rule:** If an active position has exceeded its planned holding horizon and is marked `Superseded by fresh AI signal` for >48 hours, `agent-sre` (Probe 4L) automatically queues it for graceful liquidation (`VPS_CLOSE`).
+2. This frees up tied margin, eliminates overnight financing drag, and prevents holding into adverse regime shifts.
+
+---
+
 ## 2. Autonomous Agent Activity
 Verify that the AI agents are actively evaluating the market and producing expected heartbeat logs.
 
