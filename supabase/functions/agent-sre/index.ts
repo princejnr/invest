@@ -615,6 +615,56 @@ serve(async (req) => {
       }
     }
 
+    // 4L. Stale Trade & Alpha Decay Lifecycle Manager (Section 1Y)
+    const { data: liveOpenTradesForDecay } = await supabase
+      .from("user_trades")
+      .select("id, symbol, side, status, open_price, created_at, meta_api_order_id, opportunity_id, error_message")
+      .in("status", ["OPEN", "VPS_PROCESSING"]);
+
+    if (liveOpenTradesForDecay && liveOpenTradesForDecay.length > 0) {
+      const nowMs = Date.now();
+      for (const lt of liveOpenTradesForDecay) {
+        const createdAtMs = lt.created_at ? new Date(lt.created_at).getTime() : nowMs;
+        const ageHours = (nowMs - createdAtMs) / (1000 * 60 * 60);
+
+        // Alpha decay rule: If an open position is >48h old and marked "Superseded by fresh AI signal", auto-queue for graceful exit
+        const isSuperseded = (lt.error_message || "").includes("Superseded");
+        if (isSuperseded && ageHours > 48.0 && lt.meta_api_order_id) {
+          await supabase
+            .from("user_trades")
+            .update({ 
+              status: "VPS_CLOSE", 
+              error_message: `Alpha Decay: Stale position (${ageHours.toFixed(1)}h old) superseded by fresh signal. Graceful exit queued by SRE.` 
+            })
+            .eq("id", lt.id);
+          autoRemediations.push(`Queued VPS_CLOSE for stale superseded position ${lt.symbol} (Ticket ${lt.meta_api_order_id}, ${ageHours.toFixed(1)}h old)`);
+        } else if (ageHours > 120.0) {
+          issues.push(`ℹ️ <b>Stale Open Trade Warning:</b> ${lt.symbol} (${lt.side}, Ticket ${lt.meta_api_order_id}) has been floating for ${ageHours.toFixed(1)} hours.`);
+        }
+      }
+    }
+
+    // 4M. Macro Factor (USD) Concentration Monitor
+    const USD_FACTOR_WEIGHTS: Record<string, number> = {
+      EURUSD: -1, GBPUSD: -1, AUDUSD: -1, NZDUSD: -1,
+      XAUUSD: -1, XAGUSD: -1, BTCUSD: -1,
+      USDJPY: 1, USDCHF: 1, USDCAD: 1
+    };
+    if (activeLiveTrades && activeLiveTrades.length > 0) {
+      let netUsdCount = 0;
+      for (const lt of activeLiveTrades) {
+        const w = USD_FACTOR_WEIGHTS[lt.symbol];
+        if (w !== undefined) {
+          const isL = lt.side === "LONG" || lt.side === "BUY";
+          netUsdCount += (isL ? 1 : -1) * w;
+        }
+      }
+      if (Math.abs(netUsdCount) >= 3) {
+        const bias = netUsdCount > 0 ? "LONG USD" : "SHORT USD";
+        issues.push(`⚠️ <b>High Correlated USD Exposure:</b> Net ${bias} factor concentration across ${Math.abs(netUsdCount)} open currency positions. Monitor for dollar reversal cascade.`);
+      }
+    }
+
     // ─────────────────────────────────────────────────────────────
     // PROBE 5: MT5 VPS EA Heartbeat & Connectivity
     // ─────────────────────────────────────────────────────────────

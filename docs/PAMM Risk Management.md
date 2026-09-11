@@ -99,7 +99,7 @@ $$\text{Points At Risk} = |\text{Entry Price} - \text{Stop Loss}|$$
 $$\text{Calculated Volume (Lots)} = \frac{\text{Risk Amount}}{\text{Points At Risk} \times \text{Point Value per Lot}}$$
 
 ### 4.2 Sizing Modifiers
-* **Multi-Agent Confluence ($M_{\text{confluence}}$)**: `3.0x` for multi-agent alignment within a 4-hour window; `0.5x` for counter-trend/opposing signals.
+* **Multi-Agent Confluence ($M_{\text{confluence}}$)**: `1.25x` institutional cap for multi-agent alignment within a 4-hour window (prevents single-trade over-allocation); `0.5x` for counter-trend/opposing signals.
 * **Signal Tier ($M_{\text{tier}}$)**: `1.0x` for S-Tier / A-Tier; `0.5x` for B-Tier (autopilot defaults to S/A tiers only).
 * **Calibrated Probability ($M_{\text{prob}}$)**: `0.75x` if $P(\text{win}) < 50\%$; `0.50x` (with runner leg disabled) if $P(\text{win}) < 45\%$.
 * **FOMC Macro Expansion ($M_{\text{fomc}}$)**: `1.5x` during high-impact rate catalyst regimes.
@@ -150,6 +150,14 @@ MetaTrader 5 enforces a strict minimum order volume of **0.01 lots**. On small a
 4. **Master Volume Aggregation**:
    $$\text{totalMasterVolume} = \sum_{u \in \text{Qualified Users}} \text{volume}_u$$
    The single consolidated `totalMasterVolume` is sent to the MT5 Master EA / MetaAPI. If `totalMasterVolume <= 0`, trade execution is bypassed.
+5. **Macro Factor (USD) Currency Basket Budgeting**:
+   Aggregates net directional risk across USD-quoted pairs (`EURUSD`, `GBPUSD`, `AUDUSD`, `NZDUSD`, `XAUUSD`, `XAGUSD`, `BTCUSD`, `USDJPY`, `USDCHF`, `USDCAD`). Enforces a strict **2.0% maximum net directional risk** across the entire USD basket to eliminate unhedged currency factor cascades.
+6. **12-Hour Asset Stop-Loss Cooldown**:
+   When a position is stopped out in loss (`LOST`), new entries for that symbol in the same direction are locked out for **12 hours** to eliminate revenge trading and knife-catching during adverse momentum markdowns.
+7. **Execution Idempotency & Single-Asset Exposure Cap**:
+   Orders for the same symbol cannot be executed within 2 minutes of each other, and total active committed risk on any single asset cannot exceed **2.0% of portfolio capital** across all legs.
+8. **Dynamic ATR Liquidity Sweep Buffers**:
+   Stop losses on pivot-based setups are buffered by $\ge 0.50 \times \text{ATR}_{14}$ beyond the pivot point to absorb institutional liquidity sweeps, with lot sizing scaled down proportionally.
 
 ---
 
