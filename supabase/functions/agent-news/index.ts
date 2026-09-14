@@ -682,15 +682,14 @@ Headline: "${title}"`;
           if (aiData.error) {
             console.error(`[Macro Scout] [Trace: ${traceId}] OpenAI API Error:`, aiData.error);
             const errStr = JSON.stringify(aiData.error);
-            if (errStr.includes("credit_balance_exhausted") || errStr.includes("insufficient_quota")) {
-              await supabase.from("audit_log").insert({
-                actor_type: "SYSTEM",
-                action: "AI_QUOTA_EXHAUSTED",
-                entity_type: "macro_scout",
-                payload_json: { error: aiData.error.message || errStr, headline: title },
-                created_at: new Date().toISOString()
-              });
-            }
+            const isQuotaExhausted = errStr.includes("credit_balance_exhausted") || errStr.includes("insufficient_quota");
+            await supabase.from("audit_log").insert({
+              actor_type: "SYSTEM",
+              action: isQuotaExhausted ? "AI_QUOTA_EXHAUSTED" : "AI_API_ERROR",
+              entity_type: "macro_scout",
+              payload_json: { error: aiData.error.message || errStr, code: aiData.error.code, param: aiData.error.param, headline: title },
+              created_at: new Date().toISOString()
+            }).catch(() => {});
             debugInfo.ai_errors.push(aiData);
             continue;
           }
@@ -872,6 +871,13 @@ CRITICAL RULES:
         }
       } catch (err: any) {
         console.error(`[Macro Scout] [Trace: ${traceId}] Sentiment Error:`, err.message);
+        await supabase.from("audit_log").insert({
+          actor_type: "SYSTEM",
+          action: "AGENT_CRASH",
+          entity_type: "macro_scout",
+          payload_json: { agent: "agent-news", error: err.message, stack: err.stack, trace_id: traceId },
+          created_at: new Date().toISOString()
+        }).catch(() => {});
         debugInfo.error = err.message;
       }
     }

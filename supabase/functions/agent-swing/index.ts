@@ -304,6 +304,9 @@ CRITICAL MACRO DIRECTIVE: If there are no major macroeconomic catalysts, the mac
    - Trading Central Invalidation Rule: Stop loss / Pivot point levels are managed at the confirmed CLOSE of a daily bar. Price may temporarily pierce the level intra-day without invalidating the preferred scenario.
    - Scan the LTF timeframe (1H or 30m) provided in the snapshot. Find the nearest SMC Order Block (ltf_bullish_ob_nearest / ltf_bearish_ob_nearest) or FVG.
    - Anchor your Stop Loss directly behind the LTF Order Block or structural swing pivot with >= 1.0x ATR buffer.
+   - LOCAL REACTION PIVOT ANCHORING (CRITICAL FOR COMMODITIES & METALS):
+     For high-point value assets (XAUUSD, UKOIL, USOIL, XAGUSD), NEVER set your Stop Loss at the macro cycle extreme (e.g. $4,626 - $4,728) when current price is hundreds of points away. Doing so generates a $300+ stop distance that violates the account capital risk cap ($45.00 on $1,500 capital at 0.01 lot).
+     Instead, anchor your Stop Loss to the IMMEDIATE LOCAL STRUCTURAL REACTION PIVOT (e.g. just above/below the local 50% or 61.8% Fib level, local D1/H4 Order Block, or recent breakdown pivot + 1.0x ATR buffer), keeping stop distance strictly within the asset's allowable cap (e.g. <= $41.00 for XAUUSD, <= $3.30 for UKOIL).
    - CRITICAL REQUIREMENT: Calculate your R:R mathematically before returning your parameters. Your TP2 MUST be at least 1.70x your Stop Loss distance. If current market price gives R:R < 1.70, calculate an optimal pullback Limit Order at the nearest Fib discount level to enforce an institutional >= 1:1.75 R:R.
    - EXACT PRICE FORMAT REQUIRED: Output suggested_entry_price, suggested_stop_loss, take_profit_1, take_profit_2, and take_profit_3.
 
@@ -2167,17 +2170,34 @@ serve(async (req) => {
 
           if (maxAllowableStopDistance > 0 && Math.abs(entry - sl) > maxAllowableStopDistance) {
             const rawRisk = Math.abs(entry - sl) * minLot * pointValueUsd;
-            const anchoredEntry = isLong
+            let anchoredEntry = isLong
               ? Number((sl + maxAllowableStopDistance).toFixed(5))
               : Number((sl - maxAllowableStopDistance).toFixed(5));
 
             // Check if anchoring the entry moves it too far from current market price
             if (Math.abs(anchoredEntry - currentPrice) > maxPermissibleEntryOffset) {
-              const msg = `Risk ($${rawRisk.toFixed(2)}) exceeds $${maxPermissibleCapitalRisk.toFixed(2)} cap at 0.01 lot minimum and requires entry offset (${Math.abs(anchoredEntry - currentPrice).toFixed(4)}) exceeding dynamic ATR buffer (${maxPermissibleEntryOffset.toFixed(4)}). Setup rejected to preserve capital.`;
-              console.log(`[${symbol as string}] [Origination Risk Governor] REJECTED: ${msg}`);
-              sendEvent({ type: "progress", message: `[${symbol as string}] REJECTED: ${msg}` });
-              rejections.push({ symbol: symbol as string, reason: msg, layer: "Risk Governor" });
-              return;
+              const fibList = (fib && (fib as any).levels) ? (fib as any).levels : [];
+              const localReactionLevel = isLong
+                ? (fibList.find((f: any) => f.pct === 0.618 || f.pct === 0.5)?.price || null)
+                : (fibList.find((f: any) => f.pct === 0.5 || f.pct === 0.382)?.price || null);
+
+              if (localReactionLevel && Math.abs(localReactionLevel - currentPrice) <= maxPermissibleEntryOffset) {
+                const rescuedEntry = Number(localReactionLevel.toFixed(5));
+                const rescuedSl = isLong
+                  ? Number((rescuedEntry - maxAllowableStopDistance).toFixed(5))
+                  : Number((rescuedEntry + maxAllowableStopDistance).toFixed(5));
+                console.log(`[${symbol as string}] [Origination Risk Governor] Anchoring trade to local Fib reaction level ($${rescuedEntry}) with compliant SL ($${rescuedSl}) to replace distant macro stop.`);
+                entry = rescuedEntry;
+                sl = rescuedSl;
+                evaluation.execution_parameters.suggested_stop_loss = sl;
+                anchoredEntry = rescuedEntry;
+              } else {
+                const msg = `Risk ($${rawRisk.toFixed(2)}) exceeds $${maxPermissibleCapitalRisk.toFixed(2)} cap at 0.01 lot minimum and requires entry offset (${Math.abs(anchoredEntry - currentPrice).toFixed(4)}) exceeding dynamic ATR buffer (${maxPermissibleEntryOffset.toFixed(4)}). Setup rejected to preserve capital.`;
+                console.log(`[${symbol as string}] [Origination Risk Governor] REJECTED: ${msg}`);
+                sendEvent({ type: "progress", message: `[${symbol as string}] REJECTED: ${msg}` });
+                rejections.push({ symbol: symbol as string, reason: msg, layer: "Risk Governor" });
+                return;
+              }
             }
 
             console.log(`[${symbol as string}] [Origination Risk Governor] Raw risk ($${rawRisk.toFixed(2)}) exceeds $${maxPermissibleCapitalRisk} cap. Anchoring entry to valid structural limit ($${entry} → ${anchoredEntry}).`);
@@ -2461,6 +2481,12 @@ serve(async (req) => {
           results.push({ symbol: symbol as string, id: dbData.id, tier, entry, sl, tp1, tp2, tp3, rr_to_tp2: rrToTp2 });
         } catch (symbolErr: any) {
           console.error(`[Global Error] [Trace: ${traceId}] ${symbol}: ${symbolErr.message}`);
+          await insertAuditLog(supabase, {
+            actor_type: "SYSTEM",
+            action: "AGENT_CRASH",
+            entity_type: "swing_research",
+            payload_json: { agent: "agent-swing", symbol, error: symbolErr.message, stack: symbolErr.stack, trace_id: traceId },
+          }).catch(() => {});
           rejections.push({ symbol, reason: symbolErr.message, layer: "System" });
         }
       }));
@@ -2472,6 +2498,12 @@ serve(async (req) => {
       return { opportunities: results, rejections };
     } catch (pipelineErr: any) {
       console.error(`[Pipeline Error] [Trace: ${traceId}] ${pipelineErr.message}`);
+      await insertAuditLog(supabase, {
+        actor_type: "SYSTEM",
+        action: "AGENT_CRASH",
+        entity_type: "swing_research",
+        payload_json: { agent: "agent-swing", error: pipelineErr.message, stack: pipelineErr.stack, trace_id: traceId },
+      }).catch(() => {});
       return { error: pipelineErr.message };
     }
   }

@@ -1841,6 +1841,35 @@ $$\mathcal{U}_{\text{Pareto}} = \{\mathbf{BTCUSD},\; \mathbf{ETHUSD},\; \mathbf{
 
 ---
 
+## ⚠️ 3AB. Dynamic Limit Anchor Variable Mutation & Swing Crash Telemetry (`agent-swing`)
+
+> [!CAUTION]
+> **Incident (2026-09-14):** In `agent-swing`, evaluating commodities (e.g. `XAUUSD`) caused an unhandled runtime error: `[Global Error] XAUUSD: Assignment to constant variable`. In the Origination Risk Governor, `const anchoredEntry` was declared as a constant, but when the stop distance exceeded allowable caps and triggered local Fibonacci reaction level rescue, code reassigned `anchoredEntry = rescuedEntry`. Furthermore, because `agent-swing` lacked `AGENT_CRASH` audit logging in its catch blocks, the failure was silent in `audit_log` and was undetected by `agent-sre` Probe 3.
+
+### Standard Architecture Rules:
+1. **Mutable Anchored Entry Declaration:**
+   In all dynamic limit solvers and origination risk governors (`agent-swing`, `agent-day`), variables that may be clamped or anchored to alternative Fibonacci reaction levels MUST be declared with `let` (e.g. `let anchoredEntry = ...`).
+2. **Mandatory `AGENT_CRASH` Audit Logging Parity:**
+   Every agent pipeline catch block (both per-symbol and outer pipeline) MUST insert an `action = 'AGENT_CRASH'` record into `audit_log`:
+   ```typescript
+   await insertAuditLog(supabase, {
+     actor_type: "SYSTEM",
+     action: "AGENT_CRASH",
+     entity_type: "swing_research",
+     payload_json: { agent: "agent-swing", symbol, error: symbolErr.message, stack: symbolErr.stack, trace_id: traceId },
+   }).catch(() => {});
+   ```
+   This guarantees that `agent-sre` Probe 3 detects any runtime exception within the hour.
+3. **Diagnostic Query for Unhandled Agent Crashes:**
+   ```sql
+   SELECT id, action, payload_json->>'agent' as agent, payload_json->>'error' as error, created_at
+   FROM audit_log
+   WHERE action = 'AGENT_CRASH' AND created_at > NOW() - INTERVAL '24 hours'
+   ORDER BY created_at DESC;
+   ```
+
+---
+
 ## 4. External Integrations
 Verify that external data pipelines and notification systems are alive.
 
@@ -1932,6 +1961,45 @@ Sudden failures across agents or broker executions are almost always tied to har
    - Specific trades are marked `CLOSED` / `VPS_CLOSE` but lack a computed `profit_usd` (missed callbacks), OR
    - The MT5 VPS EA bridge is offline/degraded (> 5 minutes latency), initiating emergency failover sync.
 3. **HTTP 429 Circuit-Breaker & Telemetry:** When MetaAPI returns HTTP 429, `exness-history-sync` logs `METAAPI_RATE_LIMITED` to `audit_log`, which `agent-sre` Probe 8D monitors and reports to prevent account suspension.
+
+---
+
+## ⚠️ 5C. OpenAI Reasoning Model Parameter Compliance (`max_completion_tokens`) & `AI_API_ERROR` Telemetry
+
+> [!CAUTION]
+> **Incident (2026-09-14):** When migrating `agent-news` and sibling agents to OpenAI reasoning models (e.g., `gpt-6-astra`, `o1`, `o3`), requests passing `max_tokens` failed with HTTP 400 `invalid_request_error: "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead."`. Furthermore, non-quota OpenAI errors were previously logged only to console without inserting `AI_API_ERROR` into `audit_log`, making parameter failures invisible to database telemetry.
+
+### Standard Architecture Rules:
+1. **Reasoning Model Token Parameter Branching:**
+   Any direct HTTP or SDK call to OpenAI MUST dynamically detect reasoning / Astra models and use `max_completion_tokens`:
+   ```typescript
+   const currentModel = Deno.env.get("OPENAI_MODEL") || "gpt-6-astra";
+   const isReasoning = currentModel.includes("astra") || currentModel.startsWith("o") || currentModel.includes("gpt-5") || currentModel.includes("gpt-6");
+   const payload: any = {
+     model: currentModel,
+     messages: [...]
+   };
+   if (isReasoning) {
+     payload.max_completion_tokens = 1500;
+   } else {
+     payload.temperature = 0.0;
+     payload.max_tokens = 500;
+   }
+   ```
+2. **Universal `AI_API_ERROR` Audit Logging:**
+   When OpenAI returns `aiData.error`, the edge function MUST record an audit log event with action `AI_API_ERROR` (or `AI_QUOTA_EXHAUSTED` if quota related):
+   ```typescript
+   const isQuotaExhausted = errStr.includes("credit_balance_exhausted") || errStr.includes("insufficient_quota");
+   await supabase.from("audit_log").insert({
+     actor_type: "SYSTEM",
+     action: isQuotaExhausted ? "AI_QUOTA_EXHAUSTED" : "AI_API_ERROR",
+     entity_type: "macro_scout",
+     payload_json: { error: aiData.error.message || errStr, code: aiData.error.code, param: aiData.error.param, headline: title },
+     created_at: new Date().toISOString()
+   }).catch(() => {});
+   ```
+3. **Agent SRE Telemetry Sweep (Probe 8C):**
+   `agent-sre` Probe 8 sweeps `audit_log` for `action.eq.AI_API_ERROR` and raises `🚨 OpenAI API / Parameter Error` alerts so syntax or parameter mismatches are flagged in real-time.
 
 ---
 

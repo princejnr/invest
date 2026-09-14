@@ -841,18 +841,26 @@ serve(async (req) => {
       });
     }
 
-    // 8C. Model Timeouts
-    const { data: apiTimeouts, error: timeoutErr } = await supabase
+    // 8C. Model Timeouts & AI API Errors
+    const { data: apiErrors, error: apiErrCheck } = await supabase
       .from("audit_log")
-      .select("id, payload_json, created_at")
-      .eq("action", "API_TIMEOUT")
+      .select("id, action, payload_json, created_at")
+      .or("action.eq.API_TIMEOUT,action.eq.AI_API_ERROR,action.ilike.%AI_ERROR%")
       .gte("created_at", oneHourAgoIso);
 
-    if (!timeoutErr && apiTimeouts && apiTimeouts.length > 0) {
-      apiTimeoutCount = apiTimeouts.length;
-      if (apiTimeoutCount >= 3) {
-        const sampleReason = apiTimeouts[0]?.payload_json?.error || apiTimeouts[0]?.payload_json?.reason || "API Outage";
-        issues.push(`⚠️ <b>AI Model Outage (${apiTimeoutCount} timeouts in last hour):</b> <code>${String(sampleReason).slice(0, 150)}</code>`);
+    if (!apiErrCheck && apiErrors && apiErrors.length > 0) {
+      const timeouts = apiErrors.filter((e: any) => e.action === "API_TIMEOUT");
+      const paramErrors = apiErrors.filter((e: any) => e.action !== "API_TIMEOUT");
+      apiTimeoutCount = timeouts.length;
+
+      if (timeouts.length >= 3) {
+        const sampleReason = timeouts[0]?.payload_json?.error || timeouts[0]?.payload_json?.reason || "API Outage";
+        issues.push(`⚠️ <b>AI Model Outage (${timeouts.length} timeouts in last hour):</b> <code>${String(sampleReason).slice(0, 150)}</code>`);
+      }
+
+      if (paramErrors.length > 0) {
+        const sampleErr = paramErrors[0]?.payload_json?.error || paramErrors[0]?.payload_json?.code || "AI API Error";
+        issues.push(`🚨 <b>OpenAI API / Parameter Error (${paramErrors.length} in last hour):</b> <code>${String(sampleErr).slice(0, 180)}</code>`);
       }
     }
 
