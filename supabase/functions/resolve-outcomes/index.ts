@@ -180,15 +180,23 @@ ${JSON.stringify(recentCandles)}
 Analyze the failure. Was the original reasoning flawed? Did we buy into resistance? Was it just market noise?
 Provide a concise, 1-2 sentence post-mortem explanation. Do not use markdown.`;
 
+        const currentModel = Deno.env.get("OPENAI_MODEL") || "gpt-6-astra";
+        const isReasoning = currentModel.includes("astra") || currentModel.startsWith("o") || currentModel.includes("gpt-5") || currentModel.includes("gpt-6");
+        const outcomePayload: any = {
+          model: currentModel,
+          messages: [{ role: "user", content: prompt }]
+        };
+        if (isReasoning) {
+          outcomePayload.max_completion_tokens = 800;
+        } else {
+          outcomePayload.temperature = 0.2;
+          outcomePayload.max_tokens = 120;
+        }
+
         const res = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
           headers: { "Content-Type": "application/json", "Authorization": `Bearer ${openaiKey}` },
-          body: JSON.stringify({
-            model: Deno.env.get("OPENAI_MODEL") || "gpt-6-astra",
-            messages: [{ role: "user", content: prompt }],
-            temperature: 0.2,
-            max_tokens: 120
-          })
+          body: JSON.stringify(outcomePayload)
         });
 
         if (res.ok) {

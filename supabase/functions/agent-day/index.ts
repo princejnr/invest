@@ -446,18 +446,21 @@ serve(async (req) => {
         console.log(`[Research Run] Starting pipeline for symbols: ${symbols.join(", ")}`);
         sendEvent({ type: 'progress', message: `Starting analysis pipeline for: ${symbols.join(", ")}` });
         
-        // Guard: Volatility Lockout
-        const { data: lockout } = await supabase
-          .from("market_context")
-          .select("id")
-          .eq("macro_bias", "VOLATILITY_LOCKOUT")
-          .gt("expires_at", new Date().toISOString())
-          .limit(1);
+        // Guard: Volatility Lockout (Scoped to target symbols, bypassed on manual audit)
+        if (!isManual) {
+          const { data: lockout } = await supabase
+            .from("market_context")
+            .select("id, symbol")
+            .eq("macro_bias", "VOLATILITY_LOCKOUT")
+            .in("symbol", symbols)
+            .gt("expires_at", new Date().toISOString())
+            .limit(1);
 
-        if (lockout && lockout.length > 0) {
-          console.log(`[Research Run] VOLATILITY LOCKOUT active — skipping technical analysis to avoid fundamental chaos`);
-          sendEvent({ type: 'progress', message: `[Guard] VOLATILITY LOCKOUT active — skipping technical evaluation.` });
-          return;
+          if (lockout && lockout.length > 0) {
+            console.log(`[Research Run] VOLATILITY LOCKOUT active for ${lockout[0].symbol} — skipping technical analysis to avoid fundamental chaos`);
+            sendEvent({ type: 'progress', message: `[Guard] VOLATILITY LOCKOUT active for ${lockout[0].symbol} — skipping technical evaluation.` });
+            return { opportunities: [], rejections: [{ symbol: lockout[0].symbol, reason: "VOLATILITY_LOCKOUT active", layer: "Macro" }] };
+          }
         }
         
         let allEvents = null;

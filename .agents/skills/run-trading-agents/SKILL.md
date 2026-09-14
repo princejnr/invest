@@ -290,4 +290,30 @@ When an asset fails to achieve S-Tier confidence (e.g. confidence < 75 due to mi
     - **`ETHUSD` ($0.01/pt per 0.01 lot)**: High win rate and wide structural breathing room (Risk: $273.41 \implies \$2.73$ risk; Reward to TP2: $642.51 \implies \$6.43$ reward; $EV = +\$4.14$). Extremely safe swing, but modest dollar yield on micro lots.
     - **`US30` ($0.01/pt per 0.01 lot on micro-CFD)**: High structural conviction (Double Top + RSI divergence). Risk: 1,155.44 pts ($11.55); Reward to TP2: 2,022.02 pts ($20.22); $EV = +\$12.28$ (R:R 1:1.75).
     - **`XAGUSD` ($50.00/pt per 0.01 lot)**: Extreme dollar leverage per dollar move ($50/pt). Requires tight stops ($\le \$0.66$) to stay under capital caps.
+    - **`XAUUSD` ($1.00/pt per 0.01 lot)**: Exceptional geometric clarity. An S-Tier short limit on Gold risking $41.00 ($41.00 risk) to capture TP2 $219.50 ($219.50 reward) yields an outstanding **$EV = +\$154.38** and **1:5.35 R:R**.
+24. **Reasoning Model API Compatibility Protocol (`gpt-6-astra`)**:
+    - When deploying modern reasoning models (`gpt-6-astra`, `o1`, `o3-mini`) via OpenAI API `/v1/chat/completions`:
+      * Always supply `max_completion_tokens: 1500+` instead of `max_tokens` (`Unsupported parameter: 'max_tokens' is not supported with this model`).
+      * Internal reasoning tokens are deducted from `max_completion_tokens`. Setting it too low (< 300) causes empty completions or JSON truncation.
+      * Omit `temperature` or leave at default (`Only the default (1) value is supported`).
+      * Omit `top_p`, `presence_penalty`, and `frequency_penalty`.
+25. **Symbol-Scoped Volatility Lockouts & Manual Overrides**:
+    - `market_context` entries with `agent_persona = 'VOLATILITY_LOCKOUT'` must always be queried with `.in("symbol", targetSymbols)` rather than globally across the database.
+    - An isolated macro news spike on one currency (e.g. USDCAD on Canadian CPI) must NEVER lock out un-correlated global assets (`XAUUSD`, `BTCUSD`, `UKOIL`).
+    - Passing `--is_manual` / `--manual` or `{ "is_manual": true }` must bypass volatility and market-closed gates for on-demand structural audits.
+26. **XAUUSD Macro-Technical Confluence Playbook**:
+    - **Macro Swing Geometry**: D1 Swing Low $3,959.54 $\to$ Swing High $4,728.30 ($768.76 pt range).
+    - **Key Fibonacci Structural Levels**:
+      * **23.6% Retracement**: $4,546.87 (Macro Distribution Ceiling)
+      * **38.2% Retracement**: $4,434.63 (Major Breakout Pivot / Tested Sep 9-10)
+      * **50.0% Retracement**: $4,343.92 (Key Trend Decision Level / Bearish Order Block)
+      * **61.8% Golden Pocket**: $4,253.21 (Primary Institutional Demand Floor)
+      * **78.6% Deep Retracement**: $4,124.06 (Deep Value Mean Reversion Target)
+      * **100.0% Swing Low**: $3,959.54 (Macro Cycle Base)
+    - **News Catalyst Integration (`agent-news`)**:
+      * Fed rate hike bets and surging 10Y/30Y yields generate a persistent fundamental headwind (-8/10 Bearish) on bullion.
+      * S-Tier confluence is achieved by fading pullbacks into the 50% Fib / D1 Bearish Order Block ($4,343.50) with TP1 at the Golden Pocket ($4,253.20) and TP2 at the 78.6% Fib ($4,124.00).
+27. **Local Structural Pivot Anchoring vs. Macro Extreme in Origination Risk Governor**:
+    - On commodities with $1.00+ point values (`XAUUSD`, `UKOIL`, `USOIL`), anchoring swing invalidations to the macro cycle extreme ($4,626 - $4,728) creates a $300+ stop distance that instantly triggers the $45.00 account risk cap.
+    - **Remedy**: Swings must anchor invalidation stops to the immediate local structural pivot or Fibonacci reaction level (e.g., $4,384.50 above the 50% Fib / Order Block ceiling) with a $1.0\times\text{ATR}$ buffer. This compresses stop distance to $\le \$41.00$, passing the Origination Risk Governor with 1:5.35 R:R.
 

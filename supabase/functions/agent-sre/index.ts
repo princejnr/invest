@@ -781,17 +781,25 @@ serve(async (req) => {
     const openaiKey = Deno.env.get("OPENAI_API_KEY");
     if (openaiKey) {
       try {
+        const currentModel = Deno.env.get("OPENAI_MODEL") || "gpt-6-astra";
+        const isReasoning = currentModel.includes("astra") || currentModel.startsWith("o") || currentModel.includes("gpt-5") || currentModel.includes("gpt-6");
+        const probePayload: any = {
+          model: currentModel,
+          messages: [{ role: "user", content: "ping" }]
+        };
+        if (isReasoning) {
+          probePayload.max_completion_tokens = 50;
+        } else {
+          probePayload.max_tokens = 1;
+        }
+
         const probeRes = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
           headers: {
             "Authorization": `Bearer ${openaiKey}`,
             "Content-Type": "application/json"
           },
-          body: JSON.stringify({
-            model: Deno.env.get("OPENAI_MODEL") || "gpt-6-astra",
-            messages: [{ role: "user", content: "ping" }],
-            max_tokens: 1
-          })
+          body: JSON.stringify(probePayload)
         });
 
         if (probeRes.status === 429) {

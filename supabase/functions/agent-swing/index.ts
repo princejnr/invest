@@ -727,18 +727,21 @@ serve(async (req) => {
       console.log(`[Swing Pipeline] [Trace: ${traceId}] Starting for symbols: ${symbols.join(", ")}`);
       sendEvent({ type: "progress", message: `[Swing Pipeline] [Trace: ${traceId}] Starting macro Fibonacci analysis for: ${symbols.join(", ")}` });
 
-      // Guard: Volatility Lockout
-      const { data: lockout } = await supabase
-        .from("market_context")
-        .select("id")
-        .eq("macro_bias", "VOLATILITY_LOCKOUT")
-        .gt("expires_at", new Date().toISOString())
-        .limit(1);
+      // Guard: Volatility Lockout (Scoped to target symbols, bypassed on manual audit)
+      if (!isManual) {
+        const { data: lockout } = await supabase
+          .from("market_context")
+          .select("id, symbol")
+          .eq("macro_bias", "VOLATILITY_LOCKOUT")
+          .in("symbol", symbols)
+          .gt("expires_at", new Date().toISOString())
+          .limit(1);
 
-      if (lockout && lockout.length > 0) {
-        console.log(`[Swing Pipeline] [Trace: ${traceId}] VOLATILITY LOCKOUT active — skipping technical analysis to avoid fundamental chaos`);
-        sendEvent({ type: "progress", message: `[Guard] VOLATILITY LOCKOUT active — skipping technical evaluation.` });
-        return;
+        if (lockout && lockout.length > 0) {
+          console.log(`[Swing Pipeline] [Trace: ${traceId}] VOLATILITY LOCKOUT active for ${lockout[0].symbol} — skipping technical analysis to avoid fundamental chaos`);
+          sendEvent({ type: "progress", message: `[Guard] VOLATILITY LOCKOUT active for ${lockout[0].symbol} — skipping technical evaluation.` });
+          return { opportunities: [], rejections: [{ symbol: lockout[0].symbol, reason: "VOLATILITY_LOCKOUT active", layer: "Macro" }] };
+        }
       }
 
       // Fetch macro events once
@@ -1373,15 +1376,23 @@ serve(async (req) => {
                 throw new Error("No OpenAI or Azure OpenAI keys found");
               }
 
-              const sentimentResponse = await sentimentOpenAI.chat.completions.create({
-                model: Deno.env.get("OPENAI_MODEL") || "gpt-6-astra",
+              const currentModel = Deno.env.get("OPENAI_MODEL") || "gpt-6-astra";
+              const isReasoning = currentModel.includes("astra") || currentModel.startsWith("o") || currentModel.includes("gpt-5") || currentModel.includes("gpt-6");
+              const sentimentOptions: any = {
+                model: currentModel,
                 messages: [
                   { role: "system", content: "You are a quantitative news analyst. Score the following headlines for the given financial asset strictly from -10 (extremely bearish) to +10 (extremely bullish). Output ONLY the integer score." },
                   { role: "user", content: `Asset: ${symbol}\nHeadlines:\n${headlines.join('\n')}` }
-                ],
-                temperature: 0,
-                max_tokens: 10
-              });
+                ]
+              };
+              if (isReasoning) {
+                sentimentOptions.max_completion_tokens = 500;
+              } else {
+                sentimentOptions.temperature = 0;
+                sentimentOptions.max_tokens = 10;
+              }
+
+              const sentimentResponse = await sentimentOpenAI.chat.completions.create(sentimentOptions);
 
               const parsedScore = parseInt(sentimentResponse.choices[0].message?.content?.trim() || "0", 10);
               if (!isNaN(parsedScore)) {

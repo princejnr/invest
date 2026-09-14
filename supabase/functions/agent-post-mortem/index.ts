@@ -278,21 +278,29 @@ Analyze:
 Format in clear, institutional Markdown without wrapping the entire output in code blocks.`;
 
         try {
+          const currentModel = Deno.env.get("OPENAI_MODEL") || "gpt-6-astra";
+          const isReasoning = currentModel.includes("astra") || currentModel.startsWith("o") || currentModel.includes("gpt-5") || currentModel.includes("gpt-6");
+          const postMortemPayload: any = {
+            model: currentModel,
+            messages: [
+              { role: "system", content: systemPrompt },
+              { role: "user", content: `Weekly Performance Data:\n${JSON.stringify(llmPayload, null, 2)}` },
+            ]
+          };
+          if (isReasoning) {
+            postMortemPayload.max_completion_tokens = 2500;
+          } else {
+            postMortemPayload.temperature = 0.3;
+            postMortemPayload.max_tokens = 800;
+          }
+
           const aiResponse = await fetch("https://api.openai.com/v1/chat/completions", {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
               Authorization: `Bearer ${OPENAI_API_KEY}`,
             },
-            body: JSON.stringify({
-              model: Deno.env.get("OPENAI_MODEL") || "gpt-6-astra",
-              messages: [
-                { role: "system", content: systemPrompt },
-                { role: "user", content: `Weekly Performance Data:\n${JSON.stringify(llmPayload, null, 2)}` },
-              ],
-              temperature: 0.3,
-              max_tokens: 800,
-            }),
+            body: JSON.stringify(postMortemPayload),
           });
 
           if (aiResponse.ok) {

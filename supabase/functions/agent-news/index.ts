@@ -655,18 +655,26 @@ CRITICAL RULES:
 - If the headline is a generic homepage index title (e.g. "Bitcoin News Today", "Latest Updates", "Live News"), you MUST set sentiment to NEUTRAL, confidence to 0, and symbol to NONE. Only process specific, actionable macroeconomic catalysts.
 Headline: "${title}"`;
 
+          const currentModel = Deno.env.get("OPENAI_MODEL") || "gpt-6-astra";
+          const isReasoning = currentModel.includes("astra") || currentModel.startsWith("o") || currentModel.includes("gpt-5") || currentModel.includes("gpt-6");
+          const payload: any = {
+            model: currentModel,
+            messages: [{ role: "user", content: prompt }]
+          };
+          if (isReasoning) {
+            payload.max_completion_tokens = 1500;
+          } else {
+            payload.temperature = 0.0;
+            payload.max_tokens = 500;
+          }
+
           const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
               "Authorization": `Bearer ${OPENAI_API_KEY}`
             },
-            body: JSON.stringify({
-              model: Deno.env.get("OPENAI_MODEL") || "gpt-6-astra",
-              messages: [{ role: "user", content: prompt }],
-              temperature: 0.0,
-              max_tokens: 500
-            })
+            body: JSON.stringify(payload)
           });
 
           const aiData = await aiRes.json();
@@ -755,19 +763,25 @@ CRITICAL RULES:
 - If news indicates surging crypto/Bitcoin ETF inflows, crypto regulatory approval, or institutional Bitcoin adoption: Map symbol to "BTCUSD" with BULLISH sentiment with Confidence >= 85.
 - If the headline and context refer to a generic homepage index without a specific underlying catalyst, set sentiment to NEUTRAL, confidence to 0, and symbol to NONE.`;
 
+               const verifyPayload: any = {
+                 model: currentModel,
+                 messages: [{ role: "user", content: verifyPrompt }]
+               };
+               if (isReasoning) {
+                 verifyPayload.max_completion_tokens = 800;
+               } else {
+                 verifyPayload.temperature = 0.0;
+                 verifyPayload.max_tokens = 150;
+               }
+
                const verifyRes = await fetch("https://api.openai.com/v1/chat/completions", {
                   method: "POST",
                   headers: {
                     "Content-Type": "application/json",
                     "Authorization": `Bearer ${OPENAI_API_KEY}`
                   },
-                  body: JSON.stringify({
-                    model: Deno.env.get("OPENAI_MODEL") || "gpt-6-astra",
-                    messages: [{ role: "user", content: verifyPrompt }],
-                    temperature: 0.0,
-                    max_tokens: 150
-                  })
-               });
+                   body: JSON.stringify(verifyPayload)
+                });
                const verifyData = await verifyRes.json();
                if (verifyData.choices && verifyData.choices[0]) {
                   let vt = verifyData.choices[0].message.content.trim();
