@@ -5,10 +5,17 @@ import { sma, rsi, detectRegime } from "../../../packages/strategy/index.ts";
 import { insertAuditLog } from "../../../packages/core/audit.ts";
 import { isMarketOpen, isCrypto, isUsEquity, isAsianOrPacificAsset } from "../../../packages/core/market.ts";
 import { netEdge, transactionCost, slippage } from "../../../packages/strategy/index.ts";
-import { getContextSnapshot, LogicContext, calculatePivotPoints, computeLiquiditySweepScore, calculateInstitutionalTradingCentralLevels } from "../../../packages/strategy/indicators.ts";
+import { getContextSnapshot, LogicContext, calculatePivotPoints, computeLiquiditySweepScore, calculateInstitutionalTradingCentralLevels, computeQuantitativeConfidenceScore } from "../../../packages/strategy/indicators.ts";
 import { validateGlobalSignal, validateCentralBankIntervention, validateAccountStopBounds, ASSET_CONTRACT_SIZES } from "../../../packages/strategy/agent-risk.ts";
 import { fetchAllMacroEvents, generateMacroContext, fetchRealtimeNews, detectCentralBankEvent, detectUpcomingFedEvent, computeMacroConfidenceBoost, fetchETFFlowSentiment } from "../../../packages/core/news.ts";
 import { isAutoTradingEnabled, getTradingSymbols } from "../../../packages/core/settings.ts";
+
+const MIN_DISTANCES: Record<string, number> = {
+  XAGUSD: 0.30, XAUUSD: 2.00, UKOIL: 0.30, USOIL: 0.30, BTCUSD: 150, ETHUSD: 15.0,
+  EURUSD: 0.0010, GBPUSD: 0.0010, USDJPY: 0.15, US30: 30, NAS100: 30, SPX500: 15,
+  AUDUSD: 0.0010, NZDUSD: 0.0020, EURJPY: 0.15, GBPJPY: 0.15,
+  JP225: 150, GER30: 25, AAPL: 1.50, MSFT: 2.00, NVDA: 1.50, AMZN: 1.50, TSLA: 2.50, META: 3.00, GOOGL: 1.50,
+};
 
 import { revalidateOpportunity } from "../../../packages/strategy/revalidation.ts";
 
@@ -111,7 +118,7 @@ async function evaluateOpportunity(symbol: string, snapshot: LogicContext & { ag
   console.log(`[Responses API] Submitting ${symbol} analysis...`);
   
   const body = {
-    model: "gpt-4o-mini",
+    model: Deno.env.get("OPENAI_MODEL") || "gpt-4o",
     max_output_tokens: 2500,
     input: `Evaluate the raw market data for ${symbol} on the ${timeframe} timeframe at current price ${snapshot.current_price} and autonomously originate the highest probability trade setup, if any. Return the required execution profile using the provided tools.
     
@@ -790,6 +797,13 @@ serve(async (req) => {
                 .in("status", ["OPEN", "PENDING", "VPS_PENDING", "VPS_PROCESSING"]);
               if (peerTrades && peerTrades.length > 0) {
                 openCorrelatedTrades = peerTrades;
+                // Pre-AI Correlated Asset Exposure Gate (Index / Commodity Stacking Shield)
+                const openSyms = peerTrades.map((t: any) => `${t.symbol} (${t.side})`).join(", ");
+                const rejectReason = `Skipped: Correlated Asset Shield Active. Active position(s) open in correlated peer: ${openSyms}. Pre-AI gate blocked correlated risk stacking.`;
+                console.log(`[${symbol}] [Correlation Shield] ${rejectReason}`);
+                sendEvent({ type: 'progress', message: `[${symbol}] ${rejectReason}` });
+                rejections.push({ symbol, reason: rejectReason, layer: "Correlation Shield" });
+                return;
               }
             }
 
@@ -1213,6 +1227,34 @@ serve(async (req) => {
               return;
             }
 
+            // --- MANDATORY HTF REGIME ALIGNMENT GATE ---
+            // Intraday 30m counter-trend setups must strictly possess verified institutional liquidity displacement.
+            // Trading against the 1D/4H macro trend without a liquidity sweep or S/R flip yields negative expectancy.
+            const htfTrend = (snapshot.htf_trend || "").toUpperCase();
+            if ((htfTrend === "BEARISH" || htfTrend === "BULLISH") && candidateSide && !isManual) {
+              const isCounterTrend = (htfTrend === "BEARISH" && candidateSide === "LONG") ||
+                                     (htfTrend === "BULLISH" && candidateSide === "SHORT");
+              if (isCounterTrend) {
+                const hasSweep = snapshot.asian_sweep && snapshot.asian_sweep !== "NONE";
+                const hasSweepScore = (snapshot as any).liquidity_sweep_score && (snapshot as any).liquidity_sweep_score >= 80;
+                const srFlip = (snapshot as any).sr_flip;
+                const hasSRFlip = srFlip && srFlip.type !== "NONE" && srFlip.holding_confirmed;
+                if (!hasSweep && !hasSweepScore && !hasSRFlip) {
+                  const rejectReason = `Zero-Token Pre-Filter: Mandatory HTF Regime Alignment. 1D/4H macro trend is ${htfTrend}. Proposing counter-trend ${candidateSide} without verified liquidity sweep or confirmed S/R flip is prohibited. LLM skipped.`;
+                  console.log(`[${symbol}] [HTF Gate] ${rejectReason}`);
+                  sendEvent({ type: 'progress', message: `[${symbol}] Counter-trend to ${htfTrend} without sweep. Skipped LLM.` });
+                  await insertAuditLog(supabase, {
+                    actor_type: "SYSTEM",
+                    action: "REJECTED_BY_HTF_ALIGNMENT_GATE",
+                    entity_type: "research",
+                    payload_json: { symbol, reason: rejectReason },
+                  });
+                  rejections.push({ symbol, reason: rejectReason, layer: "HTF Alignment Gate" });
+                  return;
+                }
+              }
+            }
+
             // --- PRE-AI SPREAD-TO-ATR EXPECTANCY & LIVE BROKER SPREAD GUARD (TCA Engine) ---
             if (!isManual) {
               // 1. Check if broker recently failed execution on this symbol with SPREAD_TOO_WIDE within the last 60 minutes
@@ -1440,10 +1482,11 @@ serve(async (req) => {
                 const distToPivot = Math.abs(p - snapshot.htf_pivot);
                 const isOpposingTrend = (snapshot.trend_alignment.startsWith("BULLISH") && p < snapshot.htf_pivot) ||
                                         (snapshot.trend_alignment.startsWith("BEARISH") && p > snapshot.htf_pivot);
-                if (isOpposingTrend && distToPivot < (0.75 * atr)) {
-                  const rejectReason = `Zero-Token Pre-Filter: Structural headroom suffocated by Central Pivot ($${snapshot.htf_pivot}). Distance to hurdle (${distToPivot.toFixed(4)}) < 0.75x ATR (${(0.75 * atr).toFixed(4)}). LLM skipped.`;
+                const minHurdleDist = MIN_DISTANCES[symbol] || 0;
+                if (isOpposingTrend && (distToPivot < (0.75 * atr) || (minHurdleDist > 0 && distToPivot < minHurdleDist))) {
+                  const rejectReason = `Zero-Token Pre-Filter: Structural headroom suffocated by Central Pivot ($${snapshot.htf_pivot}). Distance to hurdle (${distToPivot.toFixed(2)}) < min required threshold (0.75x ATR: ${(0.75 * atr).toFixed(2)}, Min Hurdle: ${minHurdleDist}). LLM skipped.`;
                   console.log(`[Deterministic Filter] Discarding ${symbol}: ${rejectReason}`);
-                  sendEvent({ type: 'progress', message: `[Deterministic Filter] ${symbol}: Compressed headroom to Pivot. Skipped LLM.` });
+                  sendEvent({ type: 'progress', message: `[Deterministic Filter] ${symbol}: Compressed headroom to Pivot (${distToPivot.toFixed(2)}). Skipped LLM.` });
                   await insertAuditLog(supabase, {
                     actor_type: "SYSTEM",
                     action: "REJECTED_BY_DETERMINISTIC_FILTER",
@@ -1645,41 +1688,7 @@ serve(async (req) => {
             let stop_loss = Number((evaluation.execution_parameters?.suggested_stop_loss || (dbSide === "LONG" ? snapshot.safe_long_stop_loss : snapshot.safe_short_stop_loss)).toFixed(3));
             // --- TRUST AI STRUCTURAL STOPS (No Dynamic ATR Override) ---
             
-            const MAX_CONFIDENCE_CEILING = 95;
-            let raw_confidence = evaluation.confidence_score || 50;
-            let confidence_score = raw_confidence <= 1.0 ? raw_confidence * 100 : raw_confidence;
-            confidence_score = Math.min(MAX_CONFIDENCE_CEILING, confidence_score);
-
-            // === S/R FLIP CONFLUENCE BONUS (+10) ===
-            const srFlip = (snapshot as any).sr_flip;
-            if (is_valid && srFlip && srFlip.type !== 'NONE' && srFlip.holding_confirmed) {
-              const isSRAligned = 
-                (evaluation.recommended_direction === 'LONG' && srFlip.type === 'BULLISH_SR_FLIP') ||
-                (evaluation.recommended_direction === 'SHORT' && srFlip.type === 'BEARISH_SR_FLIP');
-              if (isSRAligned) {
-                confidence_score = Math.min(MAX_CONFIDENCE_CEILING, confidence_score + 10);
-                console.log(`[Layer B] [${symbol}] S/R Flip Confluence Bonus: +10 (${srFlip.narrative})`);
-                sendEvent({ type: 'progress', message: `[${symbol}] S/R Flip Bonus: +10 (${srFlip.type} holding @ ${srFlip.flip_level})` });
-              }
-            }
-
-            // === INSTITUTIONAL SESSION OPEN LIQUIDITY BONUS (+5) ===
-            // London Open (06:30-09:30 UTC) and NY Open (12:30-15:30 UTC) provide peak institutional volume expansion and follow-through.
-            if (is_valid) {
-              const now = new Date();
-              const utcMins = now.getUTCHours() * 60 + now.getUTCMinutes();
-              const isLondonOpen = utcMins >= 390 && utcMins <= 570; // 06:30 to 09:30 UTC
-              const isNyOpen = utcMins >= 750 && utcMins <= 930;     // 12:30 to 15:30 UTC
-              if (isLondonOpen || isNyOpen) {
-                confidence_score = Math.min(MAX_CONFIDENCE_CEILING, confidence_score + 5);
-                const sessionName = isLondonOpen ? "London Open" : "NY Open";
-                console.log(`[Layer B] [${symbol}] ${sessionName} Liquidity Expansion Bonus: +5`);
-                sendEvent({ type: 'progress', message: `[${symbol}] ${sessionName} Liquidity Bonus: +5` });
-              }
-            }
-
-            // === MACRO SCOUT ALIGNMENT BONUS (+20) / PENALTY (-30) ===
-            // Multi-Agent Fundamental Confluence: Intraday setups aligning with Macro Scout receive +20 confidence boost
+            // === MACRO SCOUT FUNDAMENTAL CONFLUENCE FETCH ===
             let pendingDayNewsSide: string | null = null;
             let pendingDayNewsNarrative: string | null = null;
             if (is_valid) {
@@ -1721,19 +1730,19 @@ serve(async (req) => {
               } catch (err: any) {
                 console.warn(`[Macro Scout Check] ${symbol}: ${err.message}`);
               }
-
-              if (pendingDayNewsSide) {
-                if (evaluation.recommended_direction === pendingDayNewsSide) {
-                  confidence_score = Math.min(MAX_CONFIDENCE_CEILING, confidence_score + 20);
-                  console.log(`[Layer B] [${symbol}] Macro Scout Alignment Bonus: +20 (${pendingDayNewsSide})`);
-                  sendEvent({ type: 'progress', message: `[${symbol}] Macro Scout Alignment Bonus: +20 (${pendingDayNewsSide})` });
-                } else if (evaluation.recommended_direction !== "NONE") {
-                  confidence_score = Math.max(0, confidence_score - 30);
-                  console.log(`[Layer B] [${symbol}] Macro Scout Conflict Penalty: -30 (Technicals contradict macro ${pendingDayNewsSide})`);
-                  sendEvent({ type: 'progress', message: `[${symbol}] Macro Scout Conflict Penalty: -30 (${pendingDayNewsSide})` });
-                }
-              }
             }
+
+            // === QUANTITATIVE MULTI-FACTOR CONFIDENCE SCORING ===
+            const quantResult = computeQuantitativeConfidenceScore({
+              direction: dbSide,
+              snapshot,
+              htfTrend: snapshot.htf_trend,
+              macroBias: pendingDayNewsSide ? (pendingDayNewsSide === "LONG" ? "BULLISH" : "BEARISH") : null,
+              rawAiConfidence: evaluation.confidence_score,
+            });
+            let confidence_score = quantResult.score;
+            console.log(`[Layer B] [${symbol}] Quantitative Confidence: ${confidence_score}% (${quantResult.breakdown})`);
+            sendEvent({ type: 'progress', message: `[${symbol}] Quant Confidence: ${confidence_score}% (${quantResult.breakdown})` });
 
             let tier = "C-Tier";
             if (confidence_score >= 90) tier = "S-Tier";

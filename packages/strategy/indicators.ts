@@ -1642,6 +1642,123 @@ export function calibrateProbability(
 }
 
 // ============================================================
+// QUANTITATIVE MULTI-FACTOR CONFIDENCE ENGINE
+// Eliminates LLM overconfidence bias by anchoring confidence
+// strictly to objective quantitative metrics:
+// 1. HTF Trend Alignment (+/- 15)
+// 2. RVOL Volume Expansion (+/- 10)
+// 3. ADX Momentum Strength (+/- 10)
+// 4. Institutional Session Timing (+/- 10)
+// 5. Key Level & Liquidity Sweep Confluence (+10)
+// 6. Macro Scout Alignment (+15 / -25)
+// 7. Qualitative LLM Adjustment (+/- 5)
+// ============================================================
+export interface QuantitativeConfidenceParams {
+  direction: "LONG" | "SHORT" | string;
+  snapshot: LogicContext;
+  htfTrend?: string | null;
+  macroBias?: "BULLISH" | "BEARISH" | "NEUTRAL" | string | null;
+  rawAiConfidence?: number;
+}
+
+export function computeQuantitativeConfidenceScore(params: QuantitativeConfidenceParams): {
+  score: number;
+  breakdown: string;
+} {
+  const { direction, snapshot, htfTrend, macroBias, rawAiConfidence } = params;
+  let score = 50; // Quantitative baseline
+  const factors: string[] = ["Base: 50"];
+
+  const isLong = direction.toUpperCase() === "LONG" || direction.toUpperCase() === "BUY";
+  const isShort = direction.toUpperCase() === "SHORT" || direction.toUpperCase() === "SELL";
+
+  // 1. HTF Trend Alignment (+15 / -15)
+  const effectiveHtf = (htfTrend || snapshot.htf_trend || snapshot.trend_alignment || "").toUpperCase();
+  if ((isLong && effectiveHtf.includes("BULLISH")) || (isShort && effectiveHtf.includes("BEARISH"))) {
+    score += 15;
+    factors.push("HTF Trend Aligned (+15)");
+  } else if ((isLong && effectiveHtf.includes("BEARISH")) || (isShort && effectiveHtf.includes("BULLISH"))) {
+    score -= 15;
+    factors.push("HTF Counter-Trend (-15)");
+  }
+
+  // 2. Relative Volume (RVOL) Expansion (+10 / -10)
+  if (snapshot.volume_ratio != null) {
+    if (snapshot.volume_ratio >= 1.20) {
+      score += 10;
+      factors.push(`RVOL Expansion ${snapshot.volume_ratio.toFixed(2)}x (+10)`);
+    } else if (snapshot.volume_ratio < 0.80) {
+      score -= 10;
+      factors.push(`RVOL Anemic ${snapshot.volume_ratio.toFixed(2)}x (-10)`);
+    }
+  }
+
+  // 3. Trend Strength / ADX (+10 / -10)
+  if (snapshot.adx_14 != null) {
+    if (snapshot.adx_14 >= 25) {
+      score += 10;
+      factors.push(`ADX ${snapshot.adx_14.toFixed(1)} Strong (+10)`);
+    } else if (snapshot.adx_14 < 18) {
+      score -= 10;
+      factors.push(`ADX ${snapshot.adx_14.toFixed(1)} Chop (-10)`);
+    }
+  }
+
+  // 4. Session Timing (+10 / -5)
+  const now = new Date();
+  const utcMins = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const isLondonOpen = utcMins >= 390 && utcMins <= 570; // 06:30 - 09:30 UTC
+  const isNyOpen = utcMins >= 750 && utcMins <= 990;     // 12:30 - 16:30 UTC (London/NY overlap)
+  if (isLondonOpen || isNyOpen) {
+    score += 10;
+    factors.push("Institutional Session Window (+10)");
+  } else if (utcMins >= 1200 && utcMins <= 1380) { // 20:00 - 23:00 UTC dead zone
+    score -= 5;
+    factors.push("Off-Hours Dead Zone (-5)");
+  }
+
+  // 5. Structural Level / Liquidity Sweep Confluence (+10)
+  const srFlip = (snapshot as any).sr_flip;
+  const hasSRFlip = srFlip && srFlip.type !== "NONE" && srFlip.holding_confirmed;
+  const hasSweep = snapshot.asian_sweep && snapshot.asian_sweep !== "NONE";
+  if (hasSRFlip || hasSweep) {
+    score += 10;
+    factors.push("Key Level/Sweep Confluence (+10)");
+  }
+
+  // 6. Macro Scout Alignment (+15 / -25)
+  if (macroBias) {
+    const mb = macroBias.toUpperCase();
+    if ((isLong && mb === "BULLISH") || (isShort && mb === "BEARISH")) {
+      score += 15;
+      factors.push("Macro Scout Aligned (+15)");
+    } else if ((isLong && mb === "BEARISH") || (isShort && mb === "BULLISH")) {
+      score -= 25;
+      factors.push("Macro Scout Contradiction (-25)");
+    }
+  }
+
+  // 7. Qualitative LLM Adjustment (+/- 5 points)
+  if (rawAiConfidence != null && rawAiConfidence > 0) {
+    const normalizedAi = rawAiConfidence <= 1.0 ? rawAiConfidence * 100 : rawAiConfidence;
+    if (normalizedAi >= 90) {
+      score += 5;
+      factors.push("LLM High Conviction (+5)");
+    } else if (normalizedAi < 70) {
+      score -= 5;
+      factors.push("LLM Caution (-5)");
+    }
+  }
+
+  // Bound score strictly between 10 and 95
+  const finalScore = Math.min(95, Math.max(10, Math.round(score)));
+  return {
+    score: finalScore,
+    breakdown: factors.join(" | ")
+  };
+}
+
+// ============================================================
 // LIQUIDITY SWEEP SCORING
 // Wraps detectLiquiditySweeps() boolean output into a named,
 // human-readable pattern label with HTF trend alignment context.

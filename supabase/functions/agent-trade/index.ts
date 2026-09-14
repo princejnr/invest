@@ -1458,7 +1458,9 @@ for (const [orderId, trade] of orderMap) {
           if (isPendingOrder && barsElapsed >= 20) {
             console.log(`[Position Manager] 20-Bar Horizon Expired for pending order ${orderId} on ${trade.symbol} (${barsElapsed.toFixed(1)} bars elapsed). Cancelling.`);
             const payload = { actionType: "ORDER_CANCEL", orderId };
-            if (!isVpsAlive) {
+            if (isVpsAlive) {
+              await supabase.from("user_trades").update({ status: "VPS_CLOSE", error_message: "Expired: 20-Bar Anticipation Horizon reached" }).eq("meta_api_order_id", orderId);
+            } else {
               try {
                 await fetch(`${META_API_BASE_URL}/users/current/accounts/${META_API_ACCOUNT_ID}/trade`, {
                   method: "POST",
@@ -1468,15 +1470,43 @@ for (const [orderId, trade] of orderMap) {
               } catch (e) {
                 console.warn(`[Position Manager] MetaAPI order cancel error:`, e);
               }
+              await supabase.from("user_trades").update({ status: "CLOSED", error_message: "Expired: 20-Bar Anticipation Horizon reached" }).eq("meta_api_order_id", orderId);
             }
-            await supabase.from("user_trades").update({ status: "CLOSED", error_message: "Expired: 20-Bar Anticipation Horizon reached" }).eq("meta_api_order_id", orderId);
             moves.push({ symbol: trade.symbol, action: "20-Bar Horizon Pending Order Expiration", from: 0, to: 0 });
             continue;
           }
 
-          // --- 1C. BAR-CLOSE PIVOT INVALIDATION (Trading Central Methodology) ---
+          // --- 1B-2. STRUCTURAL INVALIDATION OF PENDING LIMIT ORDERS ---
+          // If market price breaches the invalidation pivot BEFORE the pending limit order is filled,
+          // cancel the pending order immediately to prevent getting filled into toxic adverse momentum.
           const ptiSnap = ptiMap.get(trade.symbol);
           const pivotPoint = opp.stop_plan_json?.stop || opp.stop_plan_json?.initial;
+          if (isPendingOrder && ptiSnap && ptiSnap.c && pivotPoint) {
+            const isLong = trade.side === "LONG";
+            const breachedPivot = isLong ? (ptiSnap.c <= pivotPoint) : (ptiSnap.c >= pivotPoint);
+            if (breachedPivot) {
+              console.log(`[Position Manager] Structural Invalidation for pending order ${orderId} on ${trade.symbol}! Market breached Pivot ${pivotPoint} (Current: ${ptiSnap.c}). Cancelling toxic pending order.`);
+              const payload = { actionType: "ORDER_CANCEL", orderId };
+              if (isVpsAlive) {
+                await supabase.from("user_trades").update({ status: "VPS_CLOSE", error_message: `Structural Invalidation: Market breached Pivot ${pivotPoint} prior to fill` }).eq("meta_api_order_id", orderId);
+              } else {
+                try {
+                  await fetch(`${META_API_BASE_URL}/users/current/accounts/${META_API_ACCOUNT_ID}/trade`, {
+                    method: "POST",
+                    headers: { "auth-token": META_API_TOKEN, "Content-Type": "application/json" },
+                    body: JSON.stringify(payload),
+                  });
+                } catch (e) {
+                  console.warn(`[Position Manager] MetaAPI order cancel error:`, e);
+                }
+                await supabase.from("user_trades").update({ status: "CLOSED", error_message: `Structural Invalidation: Market breached Pivot ${pivotPoint} prior to fill` }).eq("meta_api_order_id", orderId);
+              }
+              moves.push({ symbol: trade.symbol, action: "Structural Invalidation Pending Order Cancel", from: 0, to: 0 });
+              continue;
+            }
+          }
+
+          // --- 1C. BAR-CLOSE PIVOT INVALIDATION (Trading Central Methodology) ---
           if (!isPendingOrder && ptiSnap && ptiSnap.c && pivotPoint) {
             const isLong = trade.side === "LONG";
             const candleClosedBeyondPivot = isLong ? (ptiSnap.c < pivotPoint) : (ptiSnap.c > pivotPoint);

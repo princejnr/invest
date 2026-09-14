@@ -8,10 +8,17 @@ import { isMarketOpen, isCrypto, isIndex } from "../../../packages/core/market.t
 
 import { revalidateOpportunity } from "../../../packages/strategy/revalidation.ts";
 
-import { getContextSnapshot, LogicContext, isBullishEngulfing, isBearishRejection, computeHtfFibAlignment, calibrateProbability, computeLiquiditySweepScore, calculateInstitutionalTradingCentralLevels, calculateFibonacciProjections, FibonacciProjection, FibonacciProjectionsResult } from "../../../packages/strategy/indicators.ts";
+import { getContextSnapshot, LogicContext, isBullishEngulfing, isBearishRejection, computeHtfFibAlignment, calibrateProbability, computeLiquiditySweepScore, calculateInstitutionalTradingCentralLevels, calculateFibonacciProjections, FibonacciProjection, FibonacciProjectionsResult, computeQuantitativeConfidenceScore } from "../../../packages/strategy/indicators.ts";
 import { validateGlobalSignal, validateCentralBankIntervention, validateAccountStopBounds, ASSET_CONTRACT_SIZES } from "../../../packages/strategy/agent-risk.ts";
 import OpenAI from "npm:openai";
 import { z } from "npm:zod";
+
+const MIN_DISTANCES: Record<string, number> = {
+  XAGUSD: 0.30, XAUUSD: 2.00, UKOIL: 0.30, USOIL: 0.30, BTCUSD: 150, ETHUSD: 15.0,
+  EURUSD: 0.0010, GBPUSD: 0.0010, USDJPY: 0.15, US30: 30, NAS100: 30, SPX500: 15,
+  AUDUSD: 0.0010, NZDUSD: 0.0020, EURJPY: 0.15, GBPJPY: 0.15,
+  JP225: 150, GER30: 25, AAPL: 1.50, MSFT: 2.00, NVDA: 1.50, AMZN: 1.50, TSLA: 2.50, META: 3.00, GOOGL: 1.50,
+};
 
 // ============================================================
 // FIBONACCI ENGINE
@@ -378,7 +385,7 @@ CRITICAL MACRO DIRECTIVE: If there are no major macroeconomic catalysts, the mac
   console.log(`[Responses API] Submitting ${symbol} analysis...`);
   
   const body = {
-    model: "gpt-4o-mini",
+    model: Deno.env.get("OPENAI_MODEL") || "gpt-4o",
     input: userContent,
     tools: [
       {
@@ -1038,6 +1045,32 @@ serve(async (req) => {
             rejections.push({ symbol, reason: `Active position already open (${activeTrades.length} legs)`, layer: "Exposure Guard" });
             return;
           }
+
+          // Pre-AI Correlated Asset Exposure Gate (Index / Commodity Stacking Shield)
+          const correlationGroups: string[][] = [
+            ["XAUUSD", "XAGUSD"],
+            ["US30", "NAS100", "SPX500", "GER30", "JP225"],
+            ["EURUSD", "GBPUSD"],
+            ["UKOIL", "USOIL"],
+            ["AAPL", "TSLA", "NVDA", "AMZN", "MSFT", "META", "GOOGL"],
+          ];
+          const group = correlationGroups.find(g => g.includes(symbol as string));
+          if (group) {
+            const peers = group.filter(s => s !== symbol);
+            const { data: peerTrades } = await supabase
+              .from("user_trades")
+              .select("side, symbol")
+              .in("symbol", peers)
+              .in("status", ["OPEN", "PENDING", "VPS_PENDING", "VPS_PROCESSING"]);
+            if (peerTrades && peerTrades.length > 0) {
+              const openSyms = peerTrades.map((t: any) => `${t.symbol} (${t.side})`).join(", ");
+              const rejectReason = `Skipped: Correlated Asset Shield Active. Active swing position in correlated peer: ${openSyms}. Pre-AI gate blocked correlated risk stacking.`;
+              console.log(`[${symbol}] [Correlation Shield] ${rejectReason}`);
+              sendEvent({ type: 'progress', message: `[${symbol}] ${rejectReason}` });
+              rejections.push({ symbol, reason: rejectReason, layer: "Correlation Shield" });
+              return;
+            }
+          }
         }
 
         // --- LAYER -0.2: LATE-WEEK SWING ENTRY GATE (Institutional Holding Horizon Governance) ---
@@ -1177,6 +1210,16 @@ serve(async (req) => {
             type: "progress",
             message: `[${symbol}] Fib range: $${fib.swing_low.toLocaleString()} → $${fib.swing_high.toLocaleString()}. Nearest key levels: ${nearestFibs.map((f) => f.label + " @ $" + f.price.toLocaleString()).join(", ")}`,
           });
+
+          // === PRE-AI SWING STRUCTURAL HEADROOM GATE ===
+          const minSwingHurdle = (MIN_DISTANCES[symbol as string] || 0) * 2.5;
+          if (minSwingHurdle > 0 && fib.swing_range < minSwingHurdle) {
+            const rejectReason = `Zero-Token Pre-Filter: Compressed Swing Range ($${fib.swing_range.toFixed(2)} < required $${minSwingHurdle.toFixed(2)}). Asset lacks adequate structural swing volatility. LLM skipped.`;
+            console.log(`[${symbol}] [Swing Headroom Gate] ${rejectReason}`);
+            sendEvent({ type: "progress", message: `[${symbol}] Compressed swing range ($${fib.swing_range.toFixed(2)}). Skipped LLM.` });
+            rejections.push({ symbol, reason: rejectReason, layer: "Swing Headroom Gate" });
+            return;
+          }
 
           // === MARKET SNAPSHOT ===
           const snapshot = getContextSnapshot(timestamps, open, high, low, close, volume, symbol);
@@ -1668,13 +1711,20 @@ serve(async (req) => {
             return;
           }
 
-          const MAX_CONFIDENCE_CEILING = 95;
           const confidence = evaluation.confidence_score;
-          let adjustedConfidence = Math.min(MAX_CONFIDENCE_CEILING, confidence);
-          const confidenceAdjustments: string[] = [];
 
-          // === FEATURE 4: NEWS-ENHANCED CONFIDENCE BOOST (+8) ===
-          // Applies when a high-impact macro event aligns with the trade direction.
+          // === QUANTITATIVE MULTI-FACTOR CONFIDENCE ENGINE ===
+          const quantResult = computeQuantitativeConfidenceScore({
+            direction: evaluation.recommended_direction,
+            snapshot: snapshot as any,
+            htfTrend: snapshot.htf_trend,
+            macroBias: pendingNewsSide ? (pendingNewsSide === "LONG" ? "BULLISH" : "BEARISH") : null,
+            rawAiConfidence: evaluation.confidence_score,
+          });
+          let adjustedConfidence = quantResult.score;
+          const confidenceAdjustments: string[] = [quantResult.breakdown];
+
+          // Additional Swing Macro Multipliers (News Event, FOMC Window, Nikkei Yen Shock)
           const newsBoost = computeMacroConfidenceBoost(
             symbol as string,
             evaluation.recommended_direction,
@@ -1682,68 +1732,12 @@ serve(async (req) => {
             headlines
           );
           if (newsBoost > 0) {
-            adjustedConfidence = Math.min(MAX_CONFIDENCE_CEILING, adjustedConfidence + newsBoost);
-            confidenceAdjustments.push(`+${newsBoost} News-Macro Alignment`);
-            sendEvent({ type: 'progress', message: `[${symbol as string}] News-Macro Boost: +${newsBoost} (macro event aligns with ${evaluation.recommended_direction} direction)` });
+            adjustedConfidence = Math.min(95, adjustedConfidence + 5);
+            confidenceAdjustments.push(`+5 High-Impact Macro Confluence`);
           }
-
-          // === FEATURE 4B: FOMC WINDOW CONFIDENCE BOOST (+8) ===
-          // Extra boost when FOMC window is active, compounding with macro alignment.
           if (fomcModeActive && evaluation.recommended_direction !== "NONE") {
-            const fomcBoost = computeMacroConfidenceBoost(symbol as string, evaluation.recommended_direction, allEvents, headlines);
-            if (fomcBoost > 0) {
-              adjustedConfidence = Math.min(MAX_CONFIDENCE_CEILING, adjustedConfidence + 8);
-              confidenceAdjustments.push(`+8 FOMC Window Alignment (${fomcPreEventActive ? "pre-event" : "post-event"})`);
-              sendEvent({ type: 'progress', message: `[${symbol as string}] FOMC Window Boost: +8 (${fomcPreEventActive ? "pre-event" : "post-event"} macro alignment)` });
-            }
-          }
-
-          // === FEATURE 3 (applied): HTF FIB ALIGNMENT BONUS (+5) ===
-          if ((snapshot as any).htf_fib_alignment === true) {
-            adjustedConfidence = Math.min(MAX_CONFIDENCE_CEILING, adjustedConfidence + 5);
-            confidenceAdjustments.push(`+5 HTF Fib Alignment (Daily ${(snapshot as any).htf_fib_daily_level?.toFixed(2)} ≈ Weekly ${(snapshot as any).htf_fib_weekly_level?.toFixed(2)})`);
-            sendEvent({ type: 'progress', message: `[${symbol as string}] HTF Fib Alignment Bonus: +5 (daily/weekly Fib zones overlap within 0.3%)` });
-          }
-
-          // === S/R FLIP CONFLUENCE BONUS (+10) ===
-          const srFlip = (snapshot as any).sr_flip;
-          if (srFlip && srFlip.type !== 'NONE' && srFlip.holding_confirmed) {
-            const isSRAligned = 
-              (evaluation.recommended_direction === 'LONG' && srFlip.type === 'BULLISH_SR_FLIP') ||
-              (evaluation.recommended_direction === 'SHORT' && srFlip.type === 'BEARISH_SR_FLIP');
-            if (isSRAligned) {
-              adjustedConfidence = Math.min(MAX_CONFIDENCE_CEILING, adjustedConfidence + 10);
-              confidenceAdjustments.push(`+10 S/R Flip Confluence (${srFlip.type} holding @ ${srFlip.flip_level?.toFixed(2)})`);
-              sendEvent({ type: 'progress', message: `[${symbol as string}] S/R Flip Bonus: +10 (${srFlip.narrative})` });
-            }
-          }
-
-          // === INSTITUTIONAL SESSION OPEN LIQUIDITY BONUS (+5) ===
-          // London Open (06:30-09:30 UTC) and NY Open (12:30-15:30 UTC) provide peak institutional volume expansion and follow-through.
-          if (evaluation.recommended_direction !== "NONE") {
-            const now = new Date();
-            const utcMins = now.getUTCHours() * 60 + now.getUTCMinutes();
-            const isLondonOpen = utcMins >= 390 && utcMins <= 570; // 06:30 to 09:30 UTC
-            const isNyOpen = utcMins >= 750 && utcMins <= 930;     // 12:30 to 15:30 UTC
-            if (isLondonOpen || isNyOpen) {
-              adjustedConfidence = Math.min(MAX_CONFIDENCE_CEILING, adjustedConfidence + 5);
-              const sessionName = isLondonOpen ? "London Open" : "NY Open";
-              confidenceAdjustments.push(`+5 ${sessionName} Liquidity Expansion`);
-              console.log(`[Layer B] [${symbol as string}] ${sessionName} Liquidity Expansion Bonus: +5`);
-              sendEvent({ type: 'progress', message: `[${symbol as string}] ${sessionName} Liquidity Bonus: +5` });
-            }
-          }
-
-          // === MACRO SCOUT ALIGNMENT BONUS (+20) / PENALTY (-30) ===
-          if (pendingNewsSide && evaluation.recommended_direction === pendingNewsSide) {
-             adjustedConfidence = Math.min(MAX_CONFIDENCE_CEILING, adjustedConfidence + 20);
-             confidenceAdjustments.push(`+20 Macro Scout Fundamental Confluence (${pendingNewsSide})`);
-             sendEvent({ type: 'progress', message: `[${symbol as string}] MASSIVE BOOST: Technicals align perfectly with macro sentiment (${pendingNewsSide})` });
-          } else if (pendingNewsSide && evaluation.recommended_direction !== "NONE") {
-             // Technicals conflict with news
-             adjustedConfidence = Math.max(0, adjustedConfidence - 30);
-             confidenceAdjustments.push(`-30 CONFLICT: Technicals contradict macro sentiment (${pendingNewsSide})`);
-             sendEvent({ type: 'progress', message: `[${symbol as string}] PENALTY: Technicals contradict macro sentiment (${pendingNewsSide})` });
+            adjustedConfidence = Math.min(95, adjustedConfidence + 5);
+            confidenceAdjustments.push(`+5 FOMC Catalyst Alignment`);
           }
 
           // === NIKKEI 225 USDJPY MACRO PENALTY (-25) ===
@@ -1759,7 +1753,7 @@ serve(async (req) => {
                 .limit(1)
                 .maybeSingle();
               if (usdjpyNews && usdjpyNews.macro_bias === "BEARISH") {
-                adjustedConfidence = Math.max(0, adjustedConfidence - 25);
+                adjustedConfidence = Math.max(10, adjustedConfidence - 25);
                 confidenceAdjustments.push("-25 CONFLICT: USDJPY Bearish (Yen surging creates macro headwind for Nikkei)");
                 sendEvent({ type: 'progress', message: `[JP225] PENALTY: -25 (USDJPY is Bearish / Yen surging)` });
               }
