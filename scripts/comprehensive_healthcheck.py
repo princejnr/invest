@@ -188,6 +188,13 @@ if desynced_trades:
 else:
     print("  Zero desynced trades found. (All OPEN trades have profit_usd = null). Clean!")
 
+unreconciled_closed = query_table("user_trades", "status=in.(CLOSED,VPS_CLOSE)&profit_usd=is.null&limit=10")
+if unreconciled_closed:
+    for uc in unreconciled_closed:
+        print(f"  ⚠️ UNRECONCILED CLOSED TRADE (Null Profit): {uc.get('id')} | {uc.get('symbol')} | Status: {uc.get('status')} | Err: {uc.get('error_message')}")
+else:
+    print("  Zero unreconciled closed trades (All CLOSED/VPS_CLOSE trades have profit_usd populated). Clean!")
+
 # 8b. Stale Unfilled Pending Orders (> 48h)
 print("\n--- 8b. STALE UNFILLED PENDING ORDERS (> 48h) ---")
 stale_unfilled = query_table("user_trades", "status=in.(OPEN,PENDING,VPS_PENDING)&open_price=is.null&order=created_at.desc")

@@ -198,12 +198,30 @@ serve(async (req) => {
 
     const { data: openTrades, error: openTradesError } = await supabase
       .from("user_trades")
-      .select("id, user_id, volume, symbol, meta_api_order_id, status, trade_type, opportunity_id, risk_amount")
+      .select("id, user_id, volume, symbol, meta_api_order_id, status, trade_type, opportunity_id, risk_amount, open_price, error_message")
       .in("status", targetStatuses)
       .is("profit_usd", null)
       .not("meta_api_order_id", "is", null);
 
-    if (openTradesError || !openTrades || openTrades.length === 0) {
+    // Auto-reconcile cancelled/unfilled orders (they will never have broker deals)
+    const tradesNeedingDeals: any[] = [];
+    if (openTrades && openTrades.length > 0) {
+      for (const t of openTrades) {
+        const isCancelled = !t.open_price || 
+          (t.error_message && (t.error_message.includes("cancelled") || t.error_message.includes("Missed Fill") || t.error_message.includes("Duplicate Stack Liquidation")));
+        if (isCancelled && (t.status === "CLOSED" || t.status === "VPS_CLOSE")) {
+          await supabase.from("user_trades").update({
+            status: "CLOSED",
+            profit_usd: 0.0,
+            closed_at: nowIso,
+          }).eq("id", t.id);
+        } else {
+          tradesNeedingDeals.push(t);
+        }
+      }
+    }
+
+    if (openTradesError || tradesNeedingDeals.length === 0) {
       const msg = isVpsPrimaryActive
         ? "No closed trades awaiting reconciliation. Zero-latency MT5 VPS EA is active and handling live deal callbacks."
         : "No open trades to sync. Account balance reconciled.";
@@ -213,7 +231,7 @@ serve(async (req) => {
       });
     }
 
-    console.log(`[History Sync] Found ${openTrades.length} trades requiring deal reconciliation. Fetching Master history...`);
+    console.log(`[History Sync] Found ${tradesNeedingDeals.length} trades requiring deal reconciliation. Fetching Master history...`);
     
     const historyUrl = `${baseUrl}/users/current/accounts/${masterAccountId}/history-deals/time/${startTime}/${endTime}`;
     
@@ -261,7 +279,7 @@ serve(async (req) => {
 
     const resolvedTrades = [];
 
-    for (const trade of openTrades) {
+    for (const trade of tradesNeedingDeals) {
       // The positionId on the closing deal matches our meta_api_order_id (which was the original opening order id)
       const closingDeal = closingDeals.find((deal: any) => String(deal.positionId) === String(trade.meta_api_order_id));
 

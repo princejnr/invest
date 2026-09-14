@@ -1027,7 +1027,7 @@ For `UKOIL` (1,000 bbl contract, $10/point on 0.01 lot) on a $1,020 account, the
        macro_bias: "VOLATILITY_LOCKOUT",
        timeframe: "30m",
        expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
-       bias_rationale: "Extreme ATR expansion lockout",
+       narrative: "Extreme ATR expansion lockout",
      });
    ```
 
@@ -1822,6 +1822,23 @@ $$\mathcal{U}_{\text{Pareto}} = \{\mathbf{BTCUSD},\; \mathbf{ETHUSD},\; \mathbf{
 
 ---
 
+## ⚠️ 3AA. Cancelled Order `profit_usd: NULL` Trap & Stale `VPS_CLOSE` Reconciliation (Probe 4N)
+
+> [!CAUTION]
+> **Incident (2026-09-14):** 229 historical cancelled/unfilled limit orders sat in `user_trades` with `status IN ('CLOSED', 'VPS_CLOSE')` and `profit_usd IS NULL`. Because `profit_usd` was null, `exness-history-sync` treated all 229 orders as un-reconciled trades awaiting broker PnL on every 15-minute cron cycle. It repeatedly polled MetaAPI `/history-deals`, triggering HTTP 429 (`TooManyRequestsError: "accessing too many unexisting or undeployed trading accounts"`). This flooded `audit_log` with `METAAPI_RATE_LIMITED` and generated recurring false-positive `SRE_HEALTH_ALERT` warnings ("MetaAPI Service Degraded"). Additionally, an orphaned `UKOIL` trade remained stuck in `status = 'VPS_CLOSE'` for 4 days after its parent opportunity expired.
+
+### Standard Architecture Rules:
+1. **Zero-PnL Guarantee on Cancelled Orders:**
+   Any trade transitioned to `status = 'CLOSED'` due to cancellation (e.g., missed fill, stale limit order > 8h/24h/48h, de-risking) MUST have `profit_usd = 0.00` explicitly set. A cancelled order never executed on the broker and will never generate a broker deal. Leaving `profit_usd IS NULL` traps background reconciliation jobs in an endless polling loop.
+2. **Pre-Flight Filter in History Sync:**
+   `exness-history-sync` strictly filters out orders with `open_price IS NULL` or cancellation error messages from external deal queries, automatically backfilling `profit_usd = 0.00`.
+3. **Orphaned `VPS_CLOSE` Sweep (Agent SRE Probe 4N):**
+   Hourly watchdog `agent-sre` scans for any trade stuck in `VPS_CLOSE` for > 24 hours whose parent opportunity is already `CLOSED` or `EXPIRED`, auto-healing it to `status = 'CLOSED'` with `profit_usd = 0.00`.
+4. **Probe 4H `ai_risks` Sanitization:**
+   When Probe 4H restores a prematurely rejected/expired opportunity to `ACTIVE` (because live open positions exist on the broker), it resets `ai_risks` to `'Managed by AI Risk Officer'` to eliminate stale rejection notices.
+
+---
+
 ## 4. External Integrations
 Verify that external data pipelines and notification systems are alive.
 
@@ -1986,8 +2003,11 @@ The `agent-sre` edge function runs automatically every hour at `:15` via `agent-
 ### Autonomous Self-Healing Actions
 When non-critical desyncs are detected, `agent-sre` auto-remediates without human intervention:
 - **Desynced Closed Trades**: If a trade is marked `OPEN` but has a computed `profit_usd`, transitions to `WON` or `LOST`.
-- **Stale Unfilled Pending Orders**: If an order has `open_price IS NULL` and is > 48h old, cancels it to `CLOSED` and marks the parent opportunity `EXPIRED`.
+- **Stale Unfilled Pending Orders (Probe 4D)**: If an order has `open_price IS NULL` and is > 48h old, cancels it to `CLOSED` with `profit_usd = 0.0` and marks the parent opportunity `EXPIRED`.
 - **Completed Opportunities**: If a parent opportunity remains `ACTIVE`/`APPROVED` but has 0 remaining open trades, reconciles it to `WON` (if total net PnL > 0), `LOST` (if total net PnL < 0), or `EXPIRED` (if 0 trades / 0 profit).
+- **Desynced Opportunity Status (Probe 4H)**: If an opportunity is prematurely marked `EXPIRED`, `REJECTED`, or `CLOSED` while live open positions exist in `user_trades`, restores it to `ACTIVE` and resets `ai_risks = 'Managed by AI Risk Officer'`.
+- **Orphaned VPS_CLOSE Trades (Probe 4N)**: If a trade remains in `VPS_CLOSE` for > 24 hours and its parent opportunity is already expired/closed, reconciles it to `CLOSED` with `profit_usd = 0.0`.
+- **Conflicting Approval Backlog (Probe 4K)**: Automatically rejects `PENDING_APPROVAL` setups that directly oppose live open broker positions, and prunes duplicate setups older than 12h.
 - **Audit Logging & Incident Alerts**: Inserts `SRE_AUTO_REMEDIATION` and `SRE_HEARTBEAT` / `SRE_HEALTH_ALERT` into `audit_log`, and sends an HTML Telegram alert to administrators only when anomalies or active remediations occur.
 
 ---

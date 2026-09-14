@@ -147,6 +147,10 @@ SELECT jsonb_pretty(jsonb_build_object(
       FROM user_trades u
       WHERE u.status = 'OPEN' AND u.profit_usd IS NOT NULL
       UNION ALL
+      SELECT 'Unreconciled Closed Trades (Null Profit)' as issue_type, u.id, u.symbol, u.side, u.status, u.created_at
+      FROM user_trades u
+      WHERE u.status IN ('CLOSED', 'VPS_CLOSE') AND u.profit_usd IS NULL
+      UNION ALL
       SELECT 'Stale Unfilled Orders (>48h)' as issue_type, u.id, u.symbol, u.side, u.status, u.created_at
       FROM user_trades u
       WHERE u.status IN ('OPEN', 'PENDING', 'VPS_PENDING') AND u.open_price IS NULL AND u.created_at < NOW() - INTERVAL '48 hours'
@@ -252,7 +256,7 @@ SELECT jsonb_pretty(jsonb_build_object(
       'agent_persona', agent_persona,
       'timeframe', timeframe,
       'expires_at', expires_at,
-      'bias_rationale', bias_rationale
+      'narrative', narrative
     )), '[]'::jsonb)
     FROM market_context
     WHERE macro_bias IN ('VOLATILITY_LOCKOUT', 'VELOCITY_LOCKOUT')

@@ -274,6 +274,7 @@ serve(async (req) => {
       for (const su of staleUnfilled) {
         await supabase.from("user_trades").update({
           status: "CLOSED",
+          profit_usd: 0.0,
           error_message: "Order cancelled (Stale unfilled pending order > 48h by agent-sre)",
           closed_at: now.toISOString()
         }).eq("id", su.id);
@@ -442,6 +443,7 @@ serve(async (req) => {
               .update({
                 status: "ACTIVE",
                 closed_at: null,
+                ai_risks: "Managed by AI Risk Officer",
               })
               .eq("id", dOpp.id);
             autoRemediations.push(`Reconciled desynced opportunity ${dOpp.symbol} (${dOpp.id}) from ${dOpp.status} to ACTIVE (found live open trades in user_trades)`);
@@ -658,6 +660,39 @@ serve(async (req) => {
       if (Math.abs(netUsdCount) >= 3) {
         const bias = netUsdCount > 0 ? "LONG USD" : "SHORT USD";
         issues.push(`⚠️ <b>High Correlated USD Exposure:</b> Net ${bias} factor concentration across ${Math.abs(netUsdCount)} open currency positions. Monitor for dollar reversal cascade.`);
+      }
+    }
+
+    // 4N. Auto-Healing: Orphaned VPS_CLOSE Trades (> 24h old without completion)
+    const { data: orphanedVpsClose } = await supabase
+      .from("user_trades")
+      .select("id, symbol, side, opportunity_id, created_at, error_message")
+      .eq("status", "VPS_CLOSE")
+      .lte("created_at", twentyFourHoursAgoIso);
+
+    if (orphanedVpsClose && orphanedVpsClose.length > 0) {
+      for (const ovc of orphanedVpsClose) {
+        let shouldFinalize = true;
+        if (ovc.opportunity_id) {
+          const { data: parentOpp } = await supabase
+            .from("trade_opportunities")
+            .select("status")
+            .eq("id", ovc.opportunity_id)
+            .maybeSingle();
+          if (parentOpp && (parentOpp.status === "ACTIVE" || parentOpp.status === "APPROVED")) {
+            shouldFinalize = false;
+          }
+        }
+
+        if (shouldFinalize) {
+          await supabase.from("user_trades").update({
+            status: "CLOSED",
+            profit_usd: 0.0,
+            closed_at: now.toISOString(),
+            error_message: ovc.error_message || "Closed by Agent SRE (Orphaned VPS_CLOSE > 24h)",
+          }).eq("id", ovc.id);
+          autoRemediations.push(`Reconciled orphaned VPS_CLOSE trade ${ovc.symbol} (${ovc.id}) to CLOSED`);
+        }
       }
     }
 
