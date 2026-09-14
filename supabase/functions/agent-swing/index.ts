@@ -385,7 +385,7 @@ CRITICAL MACRO DIRECTIVE: If there are no major macroeconomic catalysts, the mac
   console.log(`[Responses API] Submitting ${symbol} analysis...`);
   
   const body = {
-    model: Deno.env.get("OPENAI_MODEL") || "gpt-4o",
+    model: Deno.env.get("OPENAI_MODEL") || "gpt-6-astra",
     input: userContent,
     tools: [
       {

@@ -118,7 +118,7 @@ async function evaluateOpportunity(symbol: string, snapshot: LogicContext & { ag
   console.log(`[Responses API] Submitting ${symbol} analysis...`);
   
   const body = {
-    model: Deno.env.get("OPENAI_MODEL") || "gpt-4o",
+    model: Deno.env.get("OPENAI_MODEL") || "gpt-6-astra",
     max_output_tokens: 2500,
     input: `Evaluate the raw market data for ${symbol} on the ${timeframe} timeframe at current price ${snapshot.current_price} and autonomously originate the highest probability trade setup, if any. Return the required execution profile using the provided tools.
     
