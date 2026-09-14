@@ -1870,6 +1870,26 @@ $$\mathcal{U}_{\text{Pareto}} = \{\mathbf{BTCUSD},\; \mathbf{ETHUSD},\; \mathbf{
 
 ---
 
+## ⚠️ 3AC. Autonomous Backward Limit Solver & Lower Timeframe (LTF) Drilldown Status Check Constraint (`agent-swing`)
+
+> [!CAUTION]
+> **Incident (2026-09-14):** In `agent-swing`, an S-Tier setup with a wide macro daily stop triggered the LTF Drilldown fallback to route execution to `agent-day`. When writing to `trade_opportunities`, the edge function attempted to insert `status: "PENDING_LTF_DRILLDOWN"`, which immediately failed with PostgreSQL error `23514: new row for relation "trade_opportunities" violates check constraint "trade_opportunities_status_check"`.
+
+### Standard Architecture Rules:
+1. **Autonomous Backward Limit Solver:**
+   When an initial swing stop distance exceeds allowable account capital risk bounds ($1.5\%$ NAV at $0.01$ lot minimum), the Autonomous Backward Limit Solver mathematically computes a discounted limit entry:
+   $$\text{CompliantEntry}_{\text{LONG}} = \text{SL} + \text{MaxAllowableStopDistance}$$
+   $$\text{CompliantEntry}_{\text{SHORT}} = \text{SL} - \text{MaxAllowableStopDistance}$$
+   If $\text{CompliantEntry}$ is within $1.5\times\text{ ATR}$ of the current market price, the entry is anchored to the limit with take profit targets dynamically re-expanded to maintain $\ge 1:1.75\text{ R:R}$.
+2. **Canonical Status Enforcement for LTF Routing:**
+   If the required pullback exceeds $1.5\times\text{ ATR}$, the setup is routed to Lower Timeframe (LTF) execution in `agent-day`. Because `trade_opportunities_status_check` strictly permits only:
+   `('PENDING_APPROVAL', 'PUBLISHED', 'ACTIVE', 'EXECUTED', 'APPROVED', 'REJECTED', 'WON', 'LOST', 'EXPIRED')`,
+   the parent opportunity inserted into `trade_opportunities` MUST use canonical `status = 'REJECTED'` with `ai_summary` tagged `[SWING][${tier}][LTF Drilldown]` and `ai_risks` noting the lower-timeframe routing.
+3. **Cross-Timeframe Context Handoff:**
+   In parallel with the `REJECTED` opportunity insertion, `agent-swing` inserts a record into `market_context` with `agent_persona = 'MACRO_SWING_DRILLDOWN'` and a 12-hour expiry. When `agent-day` runs its 30m cycle, it ingests this context to execute a precision intraday pullback entry with an institutional tight M30 stop.
+
+---
+
 ## 4. External Integrations
 Verify that external data pipelines and notification systems are alive.
 
