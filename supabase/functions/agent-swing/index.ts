@@ -242,8 +242,10 @@ async function evaluateSwingOpportunity(
     : "  No completed 3-point ABC swing formation established yet";
 
   const isWeekend = new Date().getDay() === 0 || new Date().getDay() === 6;
-  const isCrypto = ["BTCUSD"].includes(symbol);
-  const weekendCryptoDirective = (isWeekend && isCrypto) ? `\nCRITICAL WEEKEND CRYPTO DIRECTIVE: It is currently the weekend. Crypto volume is naturally lower. Do NOT reject setups due to 'low volume' or 'choppy ADX' compared to weekday forex baselines. Utilize a lower-volatility baseline for your momentum and breakout criteria.` : "";
+  const isCryptoAsset = isCrypto(symbol);
+  const weekendCryptoDirective = (isWeekend && isCryptoAsset) 
+    ? `\nCRITICAL WEEKEND CRYPTO DIRECTIVE: Weekend crypto markets suffer from low liquidity, retail chop, and widened market-maker spreads due to TradFi settlement closures. Only originate swing trades on H4/D1 that possess confirmed multi-day Market Structure Breaks (BOS) and an ADX >= 25. Stops must be wide (> 2.5x ATR) to withstand noise. If the market is chopping in a tight range without clear institutional expansion, strictly REJECT.` 
+    : "";
 
   const userContent = `Analyze ${symbol} on the ${timeframe} timeframe. Identify the highest-probability swing trade setup if one exists. Calculate your R:R for all three TP levels in your thought_process before filling in the execution_parameters. Return the required execution profile using the provided tools.
 ${weekendCryptoDirective}
@@ -2180,15 +2182,16 @@ serve(async (req) => {
             safeRationale += ` [Origination Risk Governor: Entry anchored to Limit @ $${entry} within tight ATR buffer so 0.01 lot dollar risk stays strictly within 3% risk cap ($${maxPermissibleCapitalRisk.toFixed(2)})]`;
           }
 
-          // === SWING INDEX CFD MARKET-TO-LIMIT CONVERTER ===
-          // For high-volatility Index CFDs, converting market orders to 0.04x ATR limit pullbacks prevents chasing range ceilings
-          if (isIndex(symbol as string) && order_type.includes("MARKET") && (snapshot.adx_14 == null || snapshot.adx_14 < 30)) {
+          // === SWING INDEX & CRYPTO MARKET-TO-LIMIT CONVERTER ===
+          // For high-volatility Index CFDs and wide-spread Crypto, converting market orders to 0.04x ATR limit pullbacks prevents chasing range ceilings
+          const isPassiveSwingAsset = isIndex(symbol as string) || isCrypto(symbol as string);
+          if (isPassiveSwingAsset && order_type.includes("MARKET") && (snapshot.adx_14 == null || snapshot.adx_14 < 30 || isCrypto(symbol as string))) {
             const pullbackOffset = (dailyAtr || 0) * 0.04;
             entry = isLong ? Number((entry - pullbackOffset).toFixed(5)) : Number((entry + pullbackOffset).toFixed(5));
             order_type = isLong ? "BUY LIMIT" : "SELL LIMIT";
             evaluation.execution_parameters.suggested_entry_price = entry;
             evaluation.execution_parameters.entry_type = isLong ? "Buy Limit" : "Sell Limit";
-            safeRationale += ` [Swing Index Microstructure: Market order converted to $0.04x ATR Pullback Limit @ $${entry} to prevent range ceiling chasing]`;
+            safeRationale += ` [Swing Microstructure: Market order converted to 0.04x ATR Pullback Limit @ $${entry} to prevent range ceiling chasing and spread penalty]`;
           }
 
           // === TAKE PROFIT DIRECTION & VOLATILITY-NORMALIZED R-MULTIPLE SANITIZATION ===

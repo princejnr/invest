@@ -2191,6 +2191,28 @@ for (const [orderId, trade] of orderMap) {
       }
     }
 
+    // === EXECUTION GUARD 2C: MINIMUM EXPECTED PROFIT HURDLE RATE ===
+    // Prevents micro-scalping where expected reward to TP1 is consumed by fixed broker friction ($0.04-$0.05 commission + spread).
+    // Gross target distance must be at least 1.0x MIN_DISTANCES[symbol] (e.g. $150 on BTC, $15 on ETH, 30 pts on US30).
+    const minHurdleDist = MIN_DISTANCES[signal.symbol];
+    if (defaultEntryPrice && minHurdleDist) {
+      const tp1 = signal.take_profit_json?.tp1 || signal.take_profit_json?.tp || takeProfit;
+      if (tp1) {
+        const targetDist = Math.abs(tp1 - defaultEntryPrice);
+        if (targetDist < minHurdleDist && !isManual) {
+          const rejectReason = `Rejected by Execution Desk: Insufficient Profit Hurdle. Distance to TP1 (${targetDist.toFixed(2)}) is below minimum viable threshold (${minHurdleDist}) for ${signal.symbol}. Micro-scalping into fixed broker commission and spreads destroys expectancy.`;
+          await supabase.from("trade_opportunities").update({ 
+            status: "REJECTED", 
+            ai_summary: (signal.ai_summary || "") + "\n\n[Execution Desk] " + rejectReason, 
+            ai_risks: rejectReason,
+            closed_at: new Date().toISOString()
+          }).eq("id", signal.id);
+          console.log(`[Execution Desk] Rejected ${signal.symbol}: ${rejectReason}`);
+          return new Response(JSON.stringify({ success: true, message: rejectReason }), { status: 200 });
+        }
+      }
+    }
+
     // --- MARKET HOURS PRE-FLIGHT CHECK (Universal Broker Guard) ---
     if (!isMarketOpen(signal.symbol)) {
       const rejectReason = `Rejected by Execution Desk: Market is closed for ${signal.symbol}.`;
@@ -2202,6 +2224,29 @@ for (const [orderId, trade] of orderMap) {
       }).eq("id", signal.id);
       console.log(`[Execution Desk] Rejected ${signal.symbol}: Market is closed.`);
       return new Response(JSON.stringify({ success: true, message: `Rejected: Market closed for ${signal.symbol}` }), { status: 200 });
+    }
+
+    // --- WEEKEND CRYPTO INTRADAY LIQUIDITY GATE ---
+    // Fiat settlement rails (Fedwire/CHIPS/SEPA) close Friday 21:00 UTC to Sunday 18:00 UTC.
+    // Intraday crypto setups (< 4h) suffer illiquid books, doubled spreads, and retail chop.
+    if (isCrypto(signal.symbol) && !isManual) {
+      const now = new Date();
+      const day = now.getUTCDay(); // 0 = Sun, 5 = Fri, 6 = Sat
+      const hour = now.getUTCHours();
+      const isWeekendWindow = (day === 5 && hour >= 21) || (day === 6) || (day === 0 && hour < 18);
+      const isIntraday = !["4H", "1D", "4h", "1d"].includes(signal.timeframe || "");
+
+      if (isWeekendWindow && isIntraday) {
+        const rejectReason = `Rejected by Execution Desk: Weekend Crypto Liquidity Gate. Intraday setups (< 4h) are locked out between Friday 21:00 UTC and Sunday 18:00 UTC due to low liquidity, retail chop, and widened market-maker spreads.`;
+        await supabase.from("trade_opportunities").update({ 
+          status: "REJECTED", 
+          ai_summary: (signal.ai_summary || "") + "\n\n[Execution Desk] " + rejectReason, 
+          ai_risks: rejectReason,
+          closed_at: new Date().toISOString()
+        }).eq("id", signal.id);
+        console.log(`[Execution Desk] Rejected ${signal.symbol}: ${rejectReason}`);
+        return new Response(JSON.stringify({ success: true, message: rejectReason }), { status: 200 });
+      }
     }
 
     // --- SYMBOL EXPOSURE & IDEMPOTENCY BURST GUARD ---

@@ -1098,6 +1098,29 @@ serve(async (req) => {
               return;
             }
 
+            // --- PRE-AI WEEKEND CRYPTO INTRADAY LIQUIDITY GATE ---
+            // Intraday 30m crypto trading on weekends suffers from fiat settlement closures (Fedwire/CHIPS/SEPA),
+            // evaporated book depth (60-80%), widened broker spreads, and high retail fakeout rates.
+            if (!isManual && isCrypto(symbol)) {
+              const now = new Date();
+              const day = now.getUTCDay(); // 0 = Sun, 5 = Fri, 6 = Sat
+              const hour = now.getUTCHours();
+              const isWeekendWindow = (day === 5 && hour >= 21) || (day === 6) || (day === 0 && hour < 18);
+              if (isWeekendWindow) {
+                const rejectReason = `Skipped: Weekend Crypto Liquidity Gate (Friday 21:00 UTC to Sunday 18:00 UTC). Intraday 30m crypto setups are blocked on weekends due to low liquidity, retail chop, and widened market-maker spreads.`;
+                console.log(`[${symbol}] [Weekend Crypto Gate] ${rejectReason}`);
+                sendEvent({ type: 'progress', message: `[${symbol}] Weekend crypto liquidity drought. Skipped LLM.` });
+                await insertAuditLog(supabase, {
+                  actor_type: "SYSTEM",
+                  action: "REJECTED_BY_WEEKEND_CRYPTO_GATE",
+                  entity_type: "research",
+                  payload_json: { symbol, reason: rejectReason },
+                });
+                rejections.push({ symbol, reason: rejectReason, layer: "Weekend Crypto Gate" });
+                return;
+              }
+            }
+
             // --- LATE-SESSION INTRADAY LIQUIDITY & ROLLOVER PROXIMITY CUTOFF ---
             // Intraday 30m positions entered after 18:30 UTC face widening spreads and dropping market depth ahead of 21:00 UTC rollover.
             // 24/7 Crypto (BTCUSD, ETHUSD) and US Equities during market open are exempt.
@@ -2190,6 +2213,39 @@ serve(async (req) => {
                   order_type = entry_price > snapshot.current_price ? 'SELL LIMIT' : 'SELL STOP';
                 }
               }
+            }
+
+            // === PASSIVE EXECUTION: MANDATORY LIMIT ORDERS FOR PULLBACK, MEAN-REVERSION & CRYPTO ===
+            // Retracement, boundary fade, mean-reversion, and all crypto trades must provide liquidity passively.
+            // Crossing the spread via market orders incurs adverse selection slippage and friction.
+            const isPassiveOrReversion = [
+              "PULLBACK",
+              "MEAN_REVERSION",
+              "ASIAN_RANGE_SWEEP",
+              "BOUNDARY_REJECTION_SCALP",
+              "RANGE_BOUNDARY_FADE",
+              "RANGE_BOUNDARY"
+            ].includes(evaluation.strategy_applied) ||
+            String(evaluation.strategy_applied || "").toUpperCase().includes("PULLBACK") ||
+            String(evaluation.strategy_applied || "").toUpperCase().includes("REVERSION") ||
+            String(evaluation.strategy_applied || "").toUpperCase().includes("RANGE") ||
+            isCrypto(symbol);
+
+            if (isPassiveOrReversion && order_type.includes("MARKET")) {
+              const isLong = dbSide === "LONG";
+              order_type = isLong ? "BUY LIMIT" : "SELL LIMIT";
+              const atrOffset = (snapshot.atr_14 && snapshot.atr_14 > 0) ? snapshot.atr_14 * 0.05 : snapshot.current_price * 0.0005;
+              
+              if (isLong) {
+                entry_price = (evaluation.execution_parameters?.suggested_entry_price && evaluation.execution_parameters.suggested_entry_price < snapshot.current_price)
+                  ? evaluation.execution_parameters.suggested_entry_price
+                  : Number((snapshot.current_price - atrOffset).toFixed(5));
+              } else {
+                entry_price = (evaluation.execution_parameters?.suggested_entry_price && evaluation.execution_parameters.suggested_entry_price > snapshot.current_price)
+                  ? evaluation.execution_parameters.suggested_entry_price
+                  : Number((snapshot.current_price + atrOffset).toFixed(5));
+              }
+              console.log(`[Passive Execution Desk] Converted ${symbol} (${evaluation.strategy_applied}) market entry to ${order_type} @ ${entry_price} to capture passive liquidity and prevent adverse slippage.`);
             }
 
             // NY Open Opening Cross Protection: Force BUY LIMIT / SELL LIMIT during 13:30-14:45 UTC to prevent market-order slippage
