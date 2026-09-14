@@ -9,7 +9,7 @@ import { isMarketOpen, isCrypto, isIndex } from "../../../packages/core/market.t
 import { revalidateOpportunity } from "../../../packages/strategy/revalidation.ts";
 
 import { getContextSnapshot, LogicContext, isBullishEngulfing, isBearishRejection, computeHtfFibAlignment, calibrateProbability, computeLiquiditySweepScore, calculateInstitutionalTradingCentralLevels, calculateFibonacciProjections, FibonacciProjection, FibonacciProjectionsResult, computeQuantitativeConfidenceScore } from "../../../packages/strategy/indicators.ts";
-import { validateGlobalSignal, validateCentralBankIntervention, validateAccountStopBounds, ASSET_CONTRACT_SIZES } from "../../../packages/strategy/agent-risk.ts";
+import { validateGlobalSignal, validateCentralBankIntervention, validateAccountStopBounds, solveAccountCompliantEntry, fetchMasterRiskSettings, ASSET_CONTRACT_SIZES } from "../../../packages/strategy/agent-risk.ts";
 import OpenAI from "npm:openai";
 import { z } from "npm:zod";
 
@@ -688,6 +688,10 @@ serve(async (req) => {
     auth: { persistSession: false },
     global: { headers: { Authorization: `Bearer ${key}` } },
   });
+
+  const masterRisk = await fetchMasterRiskSettings(supabase);
+  const livePortfolioCapital = masterRisk.portfolioCapital;
+  const liveRiskPerTradePct = masterRisk.riskPerTradePct;
 
   const dbSymbols = await getTradingSymbols(supabase);
   const isExplicitSymbolRequest = !!(reqBody.symbols || searchParams.get("symbols"));
@@ -1637,19 +1641,33 @@ serve(async (req) => {
                 ? (snapshot.safe_long_stop_loss || fib.swing_low)
                 : (snapshot.safe_short_stop_loss || fib.swing_high);
 
-              // Account-Aware Dynamic Maximum Stop Bounds (2.0% equity cap at 0.01 lot)
-              const stopBoundCheck = validateAccountStopBounds(symbol as string, currentPrice, candidateSl, 1020.0);
+              // Account-Aware Dynamic Maximum Stop Bounds check with Backward Limit Solver Feasibility
+              const stopBoundCheck = validateAccountStopBounds(symbol as string, currentPrice, candidateSl, livePortfolioCapital, liveRiskPerTradePct);
               if (!stopBoundCheck.valid) {
-                console.log(`[Deterministic Filter] Discarding ${symbol}: ${stopBoundCheck.reason}`);
-                sendEvent({ type: 'progress', message: `[Deterministic Filter] ${symbol}: Stop exceeds 2% account equity cap. Skipped LLM.` });
-                await insertAuditLog(supabase, {
-                  actor_type: "SYSTEM",
-                  action: "REJECTED_BY_DETERMINISTIC_FILTER",
-                  entity_type: "research",
-                  payload_json: { symbol, reason: stopBoundCheck.reason },
-                });
-                rejections.push({ symbol: symbol as string, reason: stopBoundCheck.reason || "Account stop bound exceeded", layer: "Deterministic Filter" });
-                return;
+                const compliantCheck = solveAccountCompliantEntry(
+                  symbol as string,
+                  candidateSl,
+                  isBullish ? "LONG" : "SHORT",
+                  currentPrice,
+                  snapshot.atr_14 || 1,
+                  livePortfolioCapital,
+                  liveRiskPerTradePct,
+                  1.50
+                );
+                if (!compliantCheck.achievable) {
+                  console.log(`[Deterministic Filter] Discarding ${symbol}: ${stopBoundCheck.reason}`);
+                  sendEvent({ type: 'progress', message: `[Deterministic Filter] ${symbol}: Stop exceeds ${(liveRiskPerTradePct * 100).toFixed(1)}% equity cap and limit entry unachievable. Skipped LLM.` });
+                  await insertAuditLog(supabase, {
+                    actor_type: "SYSTEM",
+                    action: "REJECTED_BY_DETERMINISTIC_FILTER",
+                    entity_type: "research",
+                    payload_json: { symbol, reason: stopBoundCheck.reason },
+                  });
+                  rejections.push({ symbol: symbol as string, reason: stopBoundCheck.reason || "Account stop bound exceeded", layer: "Deterministic Filter" });
+                  return;
+                } else {
+                  console.log(`[Deterministic Filter] [${symbol}] Spot stop exceeds bound, but discount Limit Entry ($${compliantCheck.compliantEntry}) is achievable (${compliantCheck.offsetAtrMultiple.toFixed(2)}x ATR). Retaining candidate for AI evaluation.`);
+                }
               }
 
               // Check candidate R:R against first Fibonacci extension or swing extreme
@@ -2153,7 +2171,7 @@ serve(async (req) => {
           };
           const contractSize = assetContractSizes[symbol as string] || 1;
           const minLot = 0.01;
-          const maxPermissibleCapitalRisk = 45.0; // 3.0% hard cap on $1,500 standard base portfolio
+          const maxPermissibleCapitalRisk = Math.max(livePortfolioCapital * liveRiskPerTradePct, 20.52); // Dynamic capital cap based on master account NAV
           
           let pointValueUsd = contractSize;
           if ((symbol as string).endsWith("JPY") && currentPrice > 0) {
@@ -2326,28 +2344,100 @@ serve(async (req) => {
           const finalSwingReward = tp2 ? Math.abs(tp2 - entry) : 0;
           const finalRrToTp2 = finalSwingRisk > 0 ? Number((finalSwingReward / finalSwingRisk).toFixed(2)) : rrToTp2;
 
-          // Final Account-Aware Dynamic Maximum Stop Bounds check (2.0% equity cap at 0.01 lot)
-          const finalStopBoundCheck = validateAccountStopBounds(symbol as string, entry, sl, 1020.0);
+          // Final Account-Aware Dynamic Maximum Stop Bounds check with Autonomous Backward Limit Solver
+          let finalStopBoundCheck = validateAccountStopBounds(symbol as string, entry, sl, livePortfolioCapital, liveRiskPerTradePct);
           if (!finalStopBoundCheck.valid) {
-            console.log(`[Swing Execution Desk] REJECTED ${symbol}: ${finalStopBoundCheck.reason}`);
-            sendEvent({ type: "progress", message: `[${symbol as string}] REJECTED: Stop exceeds 2% account equity cap.` });
-            const rejectedObj = {
-              symbol: symbol as string,
-              side: dbSide,
-              timeframe: timeframe.toLowerCase(),
-              status: "REJECTED",
-              source: "agent-swing",
-              entry_plan_json: { price: entry, order_type, scaled_entries: null },
-              stop_plan_json: { stop: sl, initial: sl, atr: snapshot.atr_14 },
-              take_profit_json: { tp: tp2, tp1, tp2, tp3 },
-              ai_summary: `[SWING][${tier}] ${safeRationale}`,
-              ai_risks: finalStopBoundCheck.reason,
-              confidence: adjustedConfidence,
-              trace_id: traceId,
-            };
-            await supabase.from("trade_opportunities").insert(rejectedObj);
-            rejections.push({ symbol: symbol as string, reason: finalStopBoundCheck.reason || "Account stop bound exceeded", layer: "Execution Desk" });
-            return;
+            const solverResult = solveAccountCompliantEntry(
+              symbol as string,
+              sl,
+              isLong ? "LONG" : "SHORT",
+              currentPrice,
+              dailyAtr || snapshot.atr_14 || 1,
+              livePortfolioCapital,
+              liveRiskPerTradePct,
+              1.50
+            );
+
+            if (solverResult.achievable) {
+              console.log(`[Swing Execution Desk] [${symbol}] Autonomous Backward Limit Solver anchored entry to compliant limit: ${entry} → ${solverResult.compliantEntry} (SL distance: ${solverResult.maxAllowableStopDistance.toFixed(3)}, dollar risk: $${solverResult.maxDollarLoss.toFixed(2)})`);
+              entry = solverResult.compliantEntry;
+              order_type = isLong ? "BUY LIMIT" : "SELL LIMIT";
+              evaluation.execution_parameters.suggested_entry_price = entry;
+              evaluation.execution_parameters.entry_type = isLong ? "Buy Limit" : "Sell Limit";
+
+              // Recalculate TP targets for expanded R:R from the new discount entry
+              const newRisk = Math.abs(entry - sl);
+              const minReward = newRisk * 1.75;
+              if (isLong) {
+                if (!tp1 || tp1 <= entry) tp1 = Number((entry + newRisk * 1.20).toFixed(5));
+                if (!tp2 || (tp2 - entry) < minReward) tp2 = Number((entry + minReward).toFixed(5));
+                if (!tp3 || tp3 <= tp2) tp3 = Number((tp2 + newRisk * 1.50).toFixed(5));
+              } else {
+                if (!tp1 || tp1 >= entry) tp1 = Number((entry - newRisk * 1.20).toFixed(5));
+                if (!tp2 || (entry - tp2) < minReward) tp2 = Number((entry - minReward).toFixed(5));
+                if (!tp3 || tp3 >= tp2) tp3 = Number((tp2 - newRisk * 1.50).toFixed(5));
+              }
+              evaluation.execution_parameters.take_profit_1 = tp1;
+              evaluation.execution_parameters.take_profit_2 = tp2;
+              evaluation.execution_parameters.take_profit_3 = tp3;
+
+              const recalculatedRr = newRisk > 0 ? (Math.abs((tp2 || 0) - entry) / newRisk).toFixed(2) : "1.75";
+              safeRationale += ` [Autonomous Limit Solver: Entry anchored to Limit @ $${entry} (SL distance $${solverResult.maxAllowableStopDistance.toFixed(3)}) ensuring 100% compliance with ${(liveRiskPerTradePct * 100).toFixed(1)}% risk cap ($${solverResult.maxDollarLoss.toFixed(2)}) with expanded R:R 1:${recalculatedRr}]`;
+
+              finalStopBoundCheck = validateAccountStopBounds(symbol as string, entry, sl, livePortfolioCapital, liveRiskPerTradePct);
+            } else if (adjustedConfidence >= 90) {
+              console.log(`[Swing Execution Desk] [${symbol}] S-Tier setup requires > 1.5x ATR pullback. Routing to PENDING_LTF_DRILLDOWN for agent-day execution.`);
+              sendEvent({ type: "progress", message: `[${symbol as string}] S-Tier (${adjustedConfidence}%): Wide daily stop requires LTF Drilldown. Routing to agent-day.` });
+
+              const drilldownObj = {
+                symbol: symbol as string,
+                side: dbSide,
+                timeframe: timeframe.toLowerCase(),
+                status: "PENDING_LTF_DRILLDOWN",
+                source: "agent-swing",
+                entry_plan_json: { price: entry, order_type, scaled_entries: null, ltf_routing: true },
+                stop_plan_json: { stop: sl, initial: sl, atr: snapshot.atr_14 },
+                take_profit_json: { tp: tp2, tp1, tp2, tp3 },
+                ai_summary: `[SWING][${tier}][PENDING_LTF_DRILLDOWN] ${safeRationale} | Routed to agent-day for tight M30 microstructure stop placement.`,
+                ai_risks: `Wide daily stop distance (${Math.abs(entry - sl).toFixed(3)}) routed to M30 drilldown for account equity protection.`,
+                confidence: adjustedConfidence,
+                trace_id: traceId,
+              };
+              await supabase.from("trade_opportunities").insert(drilldownObj);
+
+              await supabase.from("market_context").insert({
+                symbol: symbol as string,
+                agent_persona: "MACRO_SWING_DRILLDOWN",
+                timeframe: "1D",
+                macro_bias: isLong ? "BULLISH" : "BEARISH",
+                narrative: `S-Tier Swing Direction (${dbSide}) confirmed by agent-swing (${adjustedConfidence}%). Daily stop too wide. agent-day should anchor tight M30 entry.`,
+                expires_at: new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString(),
+                trace_id: traceId,
+              });
+
+              rejections.push({ symbol: symbol as string, reason: "Routed to Lower Timeframe (LTF) Drilldown", layer: "Execution Desk" });
+              return;
+            } else {
+              console.log(`[Swing Execution Desk] REJECTED ${symbol}: ${finalStopBoundCheck.reason}`);
+              sendEvent({ type: "progress", message: `[${symbol as string}] REJECTED: Stop exceeds ${(liveRiskPerTradePct * 100).toFixed(1)}% account equity cap.` });
+              const rejectedObj = {
+                symbol: symbol as string,
+                side: dbSide,
+                timeframe: timeframe.toLowerCase(),
+                status: "REJECTED",
+                source: "agent-swing",
+                entry_plan_json: { price: entry, order_type, scaled_entries: null },
+                stop_plan_json: { stop: sl, initial: sl, atr: snapshot.atr_14 },
+                take_profit_json: { tp: tp2, tp1, tp2, tp3 },
+                ai_summary: `[SWING][${tier}] ${safeRationale}`,
+                ai_risks: finalStopBoundCheck.reason,
+                confidence: adjustedConfidence,
+                trace_id: traceId,
+              };
+              await supabase.from("trade_opportunities").insert(rejectedObj);
+              rejections.push({ symbol: symbol as string, reason: finalStopBoundCheck.reason || "Account stop bound exceeded", layer: "Execution Desk" });
+              return;
+            }
           }
 
           // === APPROVED — SAVE TO DB ===
