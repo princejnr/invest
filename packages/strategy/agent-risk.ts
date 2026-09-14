@@ -76,16 +76,16 @@ export const ASSET_CONTRACT_SIZES: Record<string, number> = {
   GBPJPY: 100000,
 };
 
-// Validates that stop loss distance on candidate trades does not exceed the 2.0% account blowout cap at 0.01 lot
+// Validates that stop loss distance on candidate trades does not exceed the account blowout cap at 0.01 lot
 export function validateAccountStopBounds(
   symbol: string,
   entryPrice: number,
   stopLoss: number,
-  portfolioCapital: number = 1020.0
+  portfolioCapital: number = 1026.31,
+  maxRiskPct: number = 0.02
 ): RiskValidationResult {
   const contractSize = ASSET_CONTRACT_SIZES[symbol] || 1;
   const minLot = 0.01;
-  const maxRiskPct = 0.02; // 2.0% max loss per trade at minimum lot
   const maxDollarLoss = portfolioCapital * maxRiskPct;
 
   let pointValueUsd = contractSize;
@@ -98,15 +98,104 @@ export function validateAccountStopBounds(
   const stopDistance = Math.abs(entryPrice - stopLoss);
   const minLotDollarRisk = stopDistance * minLot * pointValueUsd;
 
-  if (minLotDollarRisk > maxDollarLoss) {
+  // Add 0.01 float rounding tolerance so exactly solved entries don't trip precision boundary
+  if (minLotDollarRisk > maxDollarLoss + 0.01) {
     const maxStopDist = maxDollarLoss / (minLot * pointValueUsd);
     return {
       valid: false,
-      reason: `REJECTED: Account-Aware Stop Bound exceeded on ${symbol}. Stop distance (${stopDistance.toFixed(3)}) risks $${minLotDollarRisk.toFixed(2)} at 0.01 lot, exceeding the 2.0% equity cap ($${maxDollarLoss.toFixed(2)} on $${portfolioCapital.toFixed(0)} capital). Maximum allowable stop distance is ${maxStopDist.toFixed(3)}.`
+      reason: `REJECTED: Account-Aware Stop Bound exceeded on ${symbol}. Stop distance (${stopDistance.toFixed(3)}) risks $${minLotDollarRisk.toFixed(2)} at 0.01 lot, exceeding the ${(maxRiskPct * 100).toFixed(1)}% equity cap ($${maxDollarLoss.toFixed(2)} on $${portfolioCapital.toFixed(0)} capital). Maximum allowable stop distance is ${maxStopDist.toFixed(3)}.`
     };
   }
 
   return { valid: true };
+}
+
+export interface CompliantEntryResult {
+  achievable: boolean;
+  maxAllowableStopDistance: number;
+  compliantEntry: number;
+  offsetDistance: number;
+  offsetAtrMultiple: number;
+  maxDollarLoss: number;
+  pointValueUsd: number;
+  reason?: string;
+}
+
+// Solves for the exact discount limit order entry price where 0.01 lot risk equals the account risk budget
+export function solveAccountCompliantEntry(
+  symbol: string,
+  stopLoss: number,
+  direction: "LONG" | "SHORT" | "BUY" | "SELL",
+  currentPrice: number,
+  atr: number,
+  portfolioCapital: number = 1026.31,
+  maxRiskPct: number = 0.02,
+  maxAtrMultipleOffset: number = 1.25
+): CompliantEntryResult {
+  const contractSize = ASSET_CONTRACT_SIZES[symbol] || 1;
+  const minLot = 0.01;
+  const maxDollarLoss = portfolioCapital * maxRiskPct;
+
+  let pointValueUsd = contractSize;
+  if (symbol.endsWith("JPY") && currentPrice > 0) {
+    pointValueUsd = contractSize / currentPrice;
+  } else if (symbol === "GER30") {
+    pointValueUsd = contractSize * 1.1;
+  }
+
+  // Use 0.999 safe buffer factor to ensure rounded entry strictly stays within risk budget
+  const maxAllowableStopDistance = (maxDollarLoss * 0.999) / (minLot * pointValueUsd);
+  const isLong = direction.toUpperCase() === "LONG" || direction.toUpperCase() === "BUY";
+
+  const compliantEntry = isLong
+    ? Number((stopLoss + maxAllowableStopDistance).toFixed(5))
+    : Number((stopLoss - maxAllowableStopDistance).toFixed(5));
+
+  const offsetDistance = Math.abs(compliantEntry - currentPrice);
+  const effectiveAtr = atr > 0 ? atr : (currentPrice * 0.01);
+  const offsetAtrMultiple = offsetDistance / effectiveAtr;
+
+  const achievable = offsetAtrMultiple <= maxAtrMultipleOffset;
+
+  return {
+    achievable,
+    maxAllowableStopDistance,
+    compliantEntry,
+    offsetDistance,
+    offsetAtrMultiple,
+    maxDollarLoss,
+    pointValueUsd,
+    reason: achievable
+      ? `Achievable discount limit: Entry @ $${compliantEntry} (SL distance ${maxAllowableStopDistance.toFixed(3)}, offset ${offsetAtrMultiple.toFixed(2)}x ATR)`
+      : `Limit entry @ $${compliantEntry} requires offset ${offsetAtrMultiple.toFixed(2)}x ATR (exceeds ${maxAtrMultipleOffset}x ATR limit)`
+  };
+}
+
+// Queries master user_risk_settings for live portfolio capital and risk parameters
+export async function fetchMasterRiskSettings(supabase: SupabaseClient): Promise<{
+  portfolioCapital: number;
+  riskPerTradePct: number;
+  highWaterMark: number;
+}> {
+  try {
+    const { data, error } = await supabase
+      .from("user_risk_settings")
+      .select("portfolio_capital, risk_per_trade_pct, high_water_mark_equity")
+      .eq("is_master_account", true)
+      .maybeSingle();
+
+    if (error || !data) {
+      return { portfolioCapital: 1026.31, riskPerTradePct: 0.02, highWaterMark: 1118.80 };
+    }
+
+    return {
+      portfolioCapital: Number(data.portfolio_capital) || 1026.31,
+      riskPerTradePct: Number(data.risk_per_trade_pct) || 0.02,
+      highWaterMark: Number(data.high_water_mark_equity) || 1118.80
+    };
+  } catch (_e) {
+    return { portfolioCapital: 1026.31, riskPerTradePct: 0.02, highWaterMark: 1118.80 };
+  }
 }
 
 // 2-Hour Symbol Generation Debounce & Anti-Burst Lockout
