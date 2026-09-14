@@ -725,8 +725,14 @@ Analyze this trade and return your verdict.
   try {
     console.log(`[Responses API] [Risk Manager] Submitting ${context.symbol} AI analysis...`);
     
+    let modelName = "gpt-6-astra";
+    try {
+      // @ts-ignore
+      modelName = (typeof Deno !== "undefined" ? Deno.env.get("OPENAI_MODEL") : process?.env?.OPENAI_MODEL) || "gpt-6-astra";
+    } catch {}
+
     const body = {
-      model: "gpt-4o",
+      model: modelName,
       input: userContent,
       tools: [
         {

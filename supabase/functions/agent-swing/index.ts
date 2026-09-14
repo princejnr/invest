@@ -1374,7 +1374,7 @@ serve(async (req) => {
               }
 
               const sentimentResponse = await sentimentOpenAI.chat.completions.create({
-                model: "gpt-4o-mini", // fast model for sentiment
+                model: Deno.env.get("OPENAI_MODEL") || "gpt-6-astra",
                 messages: [
                   { role: "system", content: "You are a quantitative news analyst. Score the following headlines for the given financial asset strictly from -10 (extremely bearish) to +10 (extremely bullish). Output ONLY the integer score." },
                   { role: "user", content: `Asset: ${symbol}\nHeadlines:\n${headlines.join('\n')}` }

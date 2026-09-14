@@ -285,7 +285,7 @@ Format in clear, institutional Markdown without wrapping the entire output in co
               Authorization: `Bearer ${OPENAI_API_KEY}`,
             },
             body: JSON.stringify({
-              model: "gpt-4o-mini",
+              model: Deno.env.get("OPENAI_MODEL") || "gpt-6-astra",
               messages: [
                 { role: "system", content: systemPrompt },
                 { role: "user", content: `Weekly Performance Data:\n${JSON.stringify(llmPayload, null, 2)}` },

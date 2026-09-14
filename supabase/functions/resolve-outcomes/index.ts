@@ -184,7 +184,7 @@ Provide a concise, 1-2 sentence post-mortem explanation. Do not use markdown.`;
           method: "POST",
           headers: { "Content-Type": "application/json", "Authorization": `Bearer ${openaiKey}` },
           body: JSON.stringify({
-            model: "gpt-4o-mini",
+            model: Deno.env.get("OPENAI_MODEL") || "gpt-6-astra",
             messages: [{ role: "user", content: prompt }],
             temperature: 0.2,
             max_tokens: 120

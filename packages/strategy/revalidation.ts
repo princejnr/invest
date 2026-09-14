@@ -62,8 +62,14 @@ You MUST respond strictly with a raw JSON object:
 
   const userPrompt = `Re-evaluate the ${signal.symbol} signal.`;
 
+  let modelName = "gpt-6-astra";
+  try {
+    // @ts-ignore
+    modelName = (typeof Deno !== "undefined" ? Deno.env.get("OPENAI_MODEL") : process?.env?.OPENAI_MODEL) || "gpt-6-astra";
+  } catch {}
+
   const response = await openai.chat.completions.create({
-    model: "gpt-4o",
+    model: modelName,
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt }

@@ -788,7 +788,7 @@ serve(async (req) => {
             "Content-Type": "application/json"
           },
           body: JSON.stringify({
-            model: "gpt-4o-mini",
+            model: Deno.env.get("OPENAI_MODEL") || "gpt-6-astra",
             messages: [{ role: "user", content: "ping" }],
             max_tokens: 1
           })

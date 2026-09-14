@@ -662,7 +662,7 @@ Headline: "${title}"`;
               "Authorization": `Bearer ${OPENAI_API_KEY}`
             },
             body: JSON.stringify({
-              model: "gpt-4o-mini",
+              model: Deno.env.get("OPENAI_MODEL") || "gpt-6-astra",
               messages: [{ role: "user", content: prompt }],
               temperature: 0.0,
               max_tokens: 500
@@ -762,7 +762,7 @@ CRITICAL RULES:
                     "Authorization": `Bearer ${OPENAI_API_KEY}`
                   },
                   body: JSON.stringify({
-                    model: "gpt-4o-mini",
+                    model: Deno.env.get("OPENAI_MODEL") || "gpt-6-astra",
                     messages: [{ role: "user", content: verifyPrompt }],
                     temperature: 0.0,
                     max_tokens: 150
