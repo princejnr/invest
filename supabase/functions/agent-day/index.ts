@@ -6,7 +6,7 @@ import { insertAuditLog } from "../../../packages/core/audit.ts";
 import { isMarketOpen, isCrypto, isUsEquity, isAsianOrPacificAsset } from "../../../packages/core/market.ts";
 import { netEdge, transactionCost, slippage } from "../../../packages/strategy/index.ts";
 import { getContextSnapshot, LogicContext, calculatePivotPoints, computeLiquiditySweepScore, calculateInstitutionalTradingCentralLevels, computeQuantitativeConfidenceScore } from "../../../packages/strategy/indicators.ts";
-import { validateGlobalSignal, validateCentralBankIntervention, validateAccountStopBounds, ASSET_CONTRACT_SIZES } from "../../../packages/strategy/agent-risk.ts";
+import { validateGlobalSignal, validateCentralBankIntervention, validateAccountStopBounds, solveAccountCompliantEntry, fetchMasterRiskSettings, ASSET_CONTRACT_SIZES } from "../../../packages/strategy/agent-risk.ts";
 import { fetchAllMacroEvents, generateMacroContext, fetchRealtimeNews, detectCentralBankEvent, detectUpcomingFedEvent, computeMacroConfidenceBoost, fetchETFFlowSentiment } from "../../../packages/core/news.ts";
 import { isAutoTradingEnabled, getTradingSymbols } from "../../../packages/core/settings.ts";
 
@@ -399,6 +399,10 @@ serve(async (req) => {
     auth: { persistSession: false },
     global: { headers: { Authorization: `Bearer ${key}` } },
   });
+
+  const masterRisk = await fetchMasterRiskSettings(supabase);
+  const livePortfolioCapital = masterRisk.portfolioCapital;
+  const liveRiskPerTradePct = masterRisk.riskPerTradePct;
 
   const dbSymbols = await getTradingSymbols(supabase);
   const isExplicitSymbolRequest = !!((reqBody as any).symbols || searchParams.get("symbols"));
@@ -1571,19 +1575,33 @@ serve(async (req) => {
                   ? (snapshot.safe_long_stop_loss || (snapshot.recent_swing_low ? snapshot.recent_swing_low - 0.25 * atr : p - 1.25 * atr))
                   : (snapshot.safe_short_stop_loss || (snapshot.recent_swing_high ? snapshot.recent_swing_high + 0.25 * atr : p + 1.25 * atr));
 
-                // Check Account-Aware Stop Bound (Max 2.0% equity at 0.01 lot)
-                const stopBoundCheck = validateAccountStopBounds(symbol, candidateEntry, candidateSl, 1020.0);
+                // Check Account-Aware Stop Bound (Max equity cap at 0.01 lot) with Pullback Solver Feasibility
+                const stopBoundCheck = validateAccountStopBounds(symbol, candidateEntry, candidateSl, livePortfolioCapital, liveRiskPerTradePct);
                 if (!stopBoundCheck.valid) {
-                  console.log(`[Deterministic Filter] Discarding ${symbol}: ${stopBoundCheck.reason}`);
-                  sendEvent({ type: 'progress', message: `[Deterministic Filter] ${symbol}: Stop exceeds 2% account equity cap. Skipped LLM.` });
-                  await insertAuditLog(supabase, {
-                    actor_type: "SYSTEM",
-                    action: "REJECTED_BY_DETERMINISTIC_FILTER",
-                    entity_type: "research",
-                    payload_json: { symbol, reason: stopBoundCheck.reason },
-                  });
-                  rejections.push({ symbol, reason: stopBoundCheck.reason || "Account stop bound exceeded", layer: "Deterministic Filter" });
-                  return;
+                  const compliantCheck = solveAccountCompliantEntry(
+                    symbol,
+                    candidateSl,
+                    isBullish ? "LONG" : "SHORT",
+                    p,
+                    atr,
+                    livePortfolioCapital,
+                    liveRiskPerTradePct,
+                    0.75
+                  );
+                  if (!compliantCheck.achievable) {
+                    console.log(`[Deterministic Filter] Discarding ${symbol}: ${stopBoundCheck.reason}`);
+                    sendEvent({ type: 'progress', message: `[Deterministic Filter] ${symbol}: Stop exceeds ${(liveRiskPerTradePct * 100).toFixed(1)}% account equity cap and limit entry unachievable. Skipped LLM.` });
+                    await insertAuditLog(supabase, {
+                      actor_type: "SYSTEM",
+                      action: "REJECTED_BY_DETERMINISTIC_FILTER",
+                      entity_type: "research",
+                      payload_json: { symbol, reason: stopBoundCheck.reason },
+                    });
+                    rejections.push({ symbol, reason: stopBoundCheck.reason || "Account stop bound exceeded", layer: "Deterministic Filter" });
+                    return;
+                  } else {
+                    console.log(`[Deterministic Filter] [${symbol}] Spot stop exceeds bound, but discount Limit Entry ($${compliantCheck.compliantEntry}) is achievable (${compliantCheck.offsetAtrMultiple.toFixed(2)}x ATR). Retaining candidate for AI evaluation.`);
+                  }
                 }
 
                 // Check immediate opposing structural boundary / target ceiling
@@ -1729,6 +1747,25 @@ serve(async (req) => {
                 if (effectiveNews?.macro_bias) {
                   pendingDayNewsSide = effectiveNews.macro_bias === "BULLISH" ? "LONG" : (effectiveNews.macro_bias === "BEARISH" ? "SHORT" : null);
                   pendingDayNewsNarrative = effectiveNews.narrative;
+                }
+
+                // Ingest S-Tier Macro Swing Drilldown context if pending
+                if (!pendingDayNewsSide) {
+                  const { data: drilldownRows } = await supabase
+                    .from("market_context")
+                    .select("id, macro_bias, narrative")
+                    .eq("symbol", symbol)
+                    .eq("agent_persona", "MACRO_SWING_DRILLDOWN")
+                    .gt("expires_at", new Date().toISOString())
+                    .order("created_at", { ascending: false })
+                    .limit(1);
+
+                  if (drilldownRows && drilldownRows.length > 0) {
+                    const dd = drilldownRows[0];
+                    pendingDayNewsSide = dd.macro_bias === "BULLISH" ? "LONG" : (dd.macro_bias === "BEARISH" ? "SHORT" : null);
+                    pendingDayNewsNarrative = `[Macro Swing S-Tier Drilldown]: ${dd.narrative}`;
+                    console.log(`[${symbol}] Ingested S-Tier Macro Swing Drilldown context: ${pendingDayNewsSide}`);
+                  }
                 }
               } catch (err: any) {
                 console.warn(`[Macro Scout Check] ${symbol}: ${err.message}`);
