@@ -133,7 +133,7 @@ To prevent multi-sleeve cross-desk cannibalization (e.g. `agent-day` shorting an
 ### 6. `agent-post-mortem` (Intelligence & CRO Weekly Analytics)
 *The Post-Mortem Auditor & Brand Amplifier.*
 - **Schedule:** Weekly Cron / Executive Invocation.
-- **Role:** Computes 7-day net R-multiples and win-rates, evaluates Shadow Ledger predictive accuracy against historical candles, triggers GPT-4o institutional CRO risk reflection, and pushes performance reports to Telegram.
+- **Role:** Computes 7-day net R-multiples and win-rates, evaluates Shadow Ledger predictive accuracy against historical candles, triggers GPT-6 Astra institutional CRO risk reflection, and pushes performance reports to Telegram.
 
 ### 7. `agent-sre` (Site Reliability Engineer & Autonomous Watchdog)
 *The Autonomous SRE Watchdog.*

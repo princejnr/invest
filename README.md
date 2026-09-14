@@ -85,7 +85,7 @@ The system is engineered to run completely hands-off, managing its own execution
   - **Day 3:** "Cost of the Delay" showcase email featuring recent winning setups.
   - **Day 7:** Direct Paystack checkout upsell to Autopilot Pro.
 - **Autonomous Watchdog (`agent-sre`):** Runs every hour at `:15` to audit 7 diagnostic subsystems, auto-remedy trade desyncs, and trigger Telegram alerts if anomalies occur.
-- **Weekly Intelligence & Social Reporting (`agent-post-mortem`):** Audits 7-day net R-multiple, win rate, and realized PnL, feeds structured metrics to GPT-4o for institutional review, and pushes formatted social summaries to Telegram.
+- **Weekly Intelligence & Social Reporting (`agent-post-mortem`):** Audits 7-day net R-multiple, win rate, and realized PnL, feeds structured metrics to GPT-6 Astra for institutional review, and pushes formatted social summaries to Telegram.
 
 ---
 

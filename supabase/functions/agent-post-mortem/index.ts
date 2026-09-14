@@ -177,7 +177,7 @@ serve(async (req) => {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // 4. CRO INSTITUTIONAL DEEP-DIVE (Shadow Ledger + GPT-4o Review)
+    // 4. CRO INSTITUTIONAL DEEP-DIVE (Shadow Ledger + GPT-6 Astra Review)
     // ─────────────────────────────────────────────────────────────
     let reflectionReport = "";
     if (mode === "CRO_REPORT" || mode === "ALL") {
@@ -252,7 +252,7 @@ serve(async (req) => {
         }
       }
 
-      // 4C. GPT-4o Reflection Analysis
+      // 4C. GPT-6 Astra Reflection Analysis
       if (OPENAI_API_KEY) {
         const llmPayload = {
           summary: summaryPayload,

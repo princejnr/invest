@@ -904,6 +904,8 @@ In `supabase/functions/agent-trade/index.ts` and `packages/strategy/agent-risk.t
 > **Incident (2026-09-08):** `agent-day` and `agent-swing` experienced `API_TIMEOUT` / JSON parsing failures (`Unterminated string in JSON`, `Expected ',' or '}' after property value`, `Unterminated fractional number`) during market evaluations on `UKOIL`, `XAUUSD`, `GER30`, and `SPX500`. 
 > 
 > **Root Cause:** `max_output_tokens` was hardcoded to `1000`. When `gpt-4o-mini` generated extensive structured rationales (`thought_process`, `rejection_math_proof`, `rationale`, `structural_confirmation`), the token ceiling was breached mid-payload, cutting off valid JSON closure.
+> 
+> **Resolution & Upgrade:** Raised `max_output_tokens` to `2500` and upgraded all agents to **GPT-6 Astra** (`gpt-6-astra`) via dynamic `OPENAI_MODEL` environment configuration.
 
 ### Standard Rules & Mitigations:
 1. **Token Allocation Ceiling:** `max_output_tokens` in `agent-day/index.ts` and `agent-swing/index.ts` must be configured to at least `2500` to provide ample buffer for multi-layer institutional reasoning. `agent-news/index.ts` must use at least `500` tokens.

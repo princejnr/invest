@@ -175,7 +175,7 @@ flowchart TD
     F -->|Daily Loss >= 5%| G[Daily Drawdown Breaker Engaged - Paused until 5PM NY]
     F -->|All-Time DD >= 10-15%| H[All-Time Max Drawdown Lockout - Permanent Halt]
     D --> I[Trigger 4-Hour Asset Cooldown]
-    D --> J[Trigger AI Post-Mortem Feedback Loop GPT-4o]
+    D --> J[Trigger AI Post-Mortem Feedback Loop GPT-6 Astra]
 ```
 
 ### 7.1 Detailed Lifecycle Stages
@@ -191,7 +191,7 @@ flowchart TD
    - Any stopped-out symbol enters a mandatory **4-hour quarantine cooldown**.
    - `validateGlobalSignal` blocks any new signal generation for that symbol if a loss occurred within the last 4 hours (`gte("closed_at", fourHoursAgo)`), preventing knife-catching or revenge trading during volatile regimes.
 4. **AI Post-Mortem Feedback Loop (`resolve-outcomes` / `agent-post-mortem`)**:
-   - For every trade closing with `LOST` status, the system passes the last 10 candles prior to the stop loss to an LLM evaluator (GPT-4o).
+   - For every trade closing with `LOST` status, the system passes the last 10 candles prior to the stop loss to an LLM evaluator (GPT-6 Astra).
    - The model diagnoses whether the failure was technical noise, premature entry, or structural invalidation, and appends a reflection summary to `trade_opportunities.ai_summary` to calibrate future signal filters.
 
 ---
@@ -247,7 +247,7 @@ In a scenario where **all currently open live trades simultaneously hit their fu
    - The **All-Time Max Drawdown Breaker (10%)** trips once drawdown exceeds $150 from High-Water Mark ($1,350 capital floor), locking out further automated risk entirely.
 3. **Quarantine & Recovery**:
    - All stopped-out assets enter a **4-hour cooldown quarantine** in `agent-risk.ts`.
-   - GPT-4o post-mortems are generated for every failure, analyzing candle structure and market condition to calibrate subsequent algorithmic entries.
+   - GPT-6 Astra post-mortems are generated for every failure, analyzing candle structure and market condition to calibrate subsequent algorithmic entries.
 
 ---
 
