@@ -151,7 +151,7 @@ serve(async (req) => {
     const { data: activeTrades, error: fetchError } = await supabase
       .from("user_trades")
       .select(`
-        id, symbol, side, volume, trade_type, status, meta_api_order_id, opportunity_id,
+        id, symbol, side, volume, trade_type, status, meta_api_order_id, opportunity_id, open_price,
         trade_opportunities (
           entry_plan_json,
           stop_plan_json,
@@ -170,7 +170,9 @@ serve(async (req) => {
     for (const trade of activeTrades) {
       const opp = trade.trade_opportunities;
       
-      const entryPrice = opp?.entry_plan_json?.price || opp?.entry_plan_json?.entry_price || opp?.entry_plan_json?.limit_price || 0;
+      const oppEntry = opp?.entry_plan_json?.price || opp?.entry_plan_json?.entry_price || opp?.entry_plan_json?.limit_price || 0;
+      const actualOpen = Number(trade.open_price) || 0;
+      const entryPrice = actualOpen > 0 ? actualOpen : oppEntry;
       const stopLossRaw = opp?.stop_plan_json?.stop || 0;
       const tpRaw = opp?.take_profit_json?.tp || 0;
       const tp1Raw = opp?.take_profit_json?.tp1;
@@ -236,12 +238,13 @@ serve(async (req) => {
           // Breakeven Lock: Set SL to entry price with spread/commission friction buffer
           const isLong = trade.side === "LONG" || trade.side === "BUY";
           let minBuffer = 0;
-          if (trade.symbol === "BTCUSD" || trade.symbol === "ETHUSD") minBuffer = 2.0;
-          else if (["US30", "NAS100", "SPX500", "GER30", "JP225", "DE30", "USTEC", "US500"].includes(trade.symbol)) minBuffer = 0.50;
-          else if (trade.symbol.includes("XAU") || trade.symbol.includes("XAG")) minBuffer = 0.25;
-          else if (trade.symbol.includes("OIL")) minBuffer = 0.05;
-          else if (decimals === 3) minBuffer = 0.015;
-          else minBuffer = 0.00012;
+          if (trade.symbol === "BTCUSD") minBuffer = 35.0;
+          else if (trade.symbol === "ETHUSD") minBuffer = 3.0;
+          else if (["US30", "NAS100", "SPX500", "GER30", "JP225", "DE30", "USTEC", "US500"].includes(trade.symbol)) minBuffer = 1.00;
+          else if (trade.symbol.includes("XAU") || trade.symbol.includes("XAG")) minBuffer = 0.50;
+          else if (trade.symbol.includes("OIL")) minBuffer = 0.10;
+          else if (decimals === 3) minBuffer = 0.020;
+          else minBuffer = 0.00025;
 
           const buffer = Math.max(riskDistance * 0.05, minBuffer);
           const beSl = Number((isLong ? safeEntry + buffer : safeEntry - buffer).toFixed(decimals));

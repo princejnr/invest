@@ -1390,11 +1390,11 @@ serve(async (req) => {
               }
 
               // Relative Volume (RVOL) Expansion Filter
-              // If relative volume is anemic (<0.65x) without an active boundary liquidity sweep or confirmed S/R flip, reject pre-AI.
+              // If relative volume is anemic (<0.65x) without an active boundary liquidity sweep, reject pre-AI.
+              // Theoretical S/R flips without volume expansion in chop regimes lead to premature stop-out traps.
               if (snapshot.volume_ratio != null && snapshot.volume_ratio < 0.65 && snapshot.volume_regime === "ANEMIC") {
                 const hasSweep = snapshot.asian_sweep && snapshot.asian_sweep !== "NONE";
-                const hasSRFlip = snapshot.sr_flip && (snapshot.sr_flip as any).type !== "NONE" && (snapshot.sr_flip as any).holding_confirmed;
-                if (!hasSweep && !hasSRFlip) {
+                if (!hasSweep) {
                   const rejectReason = `Zero-Token Pre-Filter: Anemic relative volume (RVOL ${(snapshot.volume_ratio * 100).toFixed(0)}% < 65% 20-SMA). Institutional breakout/pullback follow-through requires volume expansion. LLM skipped.`;
                   console.log(`[Deterministic Filter] Discarding ${symbol}: ${rejectReason}`);
                   sendEvent({ type: 'progress', message: `[Deterministic Filter] ${symbol}: Low volume (${(snapshot.volume_ratio * 100).toFixed(0)}% RVOL). Skipped LLM.` });

@@ -157,6 +157,20 @@ function isMarketOpen(symbol: string): boolean {
   return true;
 }
 
+const SPREAD_BUFFERS: Record<string, number> = {
+  XAGUSD: 0.05, XAUUSD: 0.50, UKOIL: 0.05, BTCUSD: 25, ETHUSD: 2.0,
+  EURUSD: 0.0003, GBPUSD: 0.0003, USDJPY: 0.03, US30: 5, NAS100: 5,
+  AUDUSD: 0.0003, NZDUSD: 0.0003, EURJPY: 0.03, GBPJPY: 0.03,
+  JP225: 15, AAPL: 0.15, MSFT: 0.25, NVDA: 0.20, AMZN: 0.20, TSLA: 0.30, META: 0.35, GOOGL: 0.20,
+};
+
+const MIN_DISTANCES: Record<string, number> = {
+  XAGUSD: 0.30, XAUUSD: 2.00, UKOIL: 0.30, BTCUSD: 150, ETHUSD: 15.0,
+  EURUSD: 0.0010, GBPUSD: 0.0010, USDJPY: 0.15, US30: 30, NAS100: 30,
+  AUDUSD: 0.0010, NZDUSD: 0.0020, EURJPY: 0.15, GBPJPY: 0.15,
+  JP225: 150, AAPL: 1.50, MSFT: 2.00, NVDA: 1.50, AMZN: 1.50, TSLA: 2.50, META: 3.00, GOOGL: 1.50,
+};
+
 async function fetchRecentBars(supabase: any, symbol: string, limit = 50) {
   try {
     const { data } = await supabase
@@ -1487,91 +1501,11 @@ for (const [orderId, trade] of orderMap) {
                 }
               }
 
-              // --- 1D. CONTINGENT ALTERNATIVE SCENARIO AUTO-EXECUTION (Trading Central Methodology) ---
-              // When the preferred thesis is invalidated by a confirmed candle close beyond the Pivot,
-              // immediately stage the alternative scenario to capture the directional reversal breakout.
-              try {
-                const altScenario = opp.entry_plan_json?.trading_central_levels?.alternative_scenario;
-                if (altScenario && altScenario.direction && altScenario.target_1 && altScenario.target_2) {
-                  const altSide = altScenario.direction;
-                  const altEntry = Number(ptiSnap.c.toFixed(5));
-                  const altSl = Number(pivotPoint.toFixed(5));
-                  const altTp1 = Number(altScenario.target_1.toFixed(5));
-                  const altTp2 = Number(altScenario.target_2.toFixed(5));
-                  const altRisk = Math.abs(altEntry - altSl);
-                  const altReward = Math.abs(altTp2 - altEntry);
-                  const altRr = altRisk > 0 ? altReward / altRisk : 0;
-
-                  // Verify the alternative setup maintains institutional R:R >= 1.50
-                  if (altRr >= 1.50) {
-                    const tenMinsAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
-                    const { data: existingFlip } = await supabase
-                      .from("trade_opportunities")
-                      .select("id")
-                      .eq("symbol", trade.symbol)
-                      .eq("side", altSide)
-                      .gte("created_at", tenMinsAgo)
-                      .limit(1);
-
-                    if (!existingFlip || existingFlip.length === 0) {
-                      console.log(`[Position Manager] Auto-Origination: Triggering Alternative Scenario for ${trade.symbol} (${altSide}) targeting TP1: ${altTp1}, TP2: ${altTp2}.`);
-                      
-                      const flipRationale = `[Trading Central Contingent Flip] Preferred ${trade.side} thesis invalidated on bar close beyond Pivot ($${pivotPoint}). Autonomously activated Alternative Scenario: ${altSide} towards TP1 $${altTp1} and TP2 $${altTp2}. Invalidation/Pivot set at $${altSl}.`;
-
-                      const { data: newFlipOpp } = await supabase
-                        .from("trade_opportunities")
-                        .insert({
-                          symbol: trade.symbol,
-                          side: altSide,
-                          timeframe: opp.timeframe || "30m",
-                          status: "APPROVED",
-                          source: "agent-trade-contingent-flip",
-                          entry_plan_json: {
-                            price: altEntry,
-                            order_type: altSide === "LONG" ? "BUY MARKET" : "SELL MARKET",
-                            max_holding_bars: 20,
-                            horizon_hours: opp.timeframe === "1d" ? 480 : 10,
-                          },
-                          stop_plan_json: { stop: altSl, initial: altSl },
-                          take_profit_json: { tp: altTp2, tp1: altTp1, tp2: altTp2 },
-                          risk_summary: `Contingent Flip | R:R 1:${altRr.toFixed(1)}`,
-                          confidence: 82,
-                          ai_summary: flipRationale,
-                          ai_risks: "Managed by AI Risk Officer (Contingent Alternative Flip)",
-                        })
-                        .select("id")
-                        .single();
-
-                      if (newFlipOpp) {
-                        moves.push({
-                          symbol: trade.symbol,
-                          action: `Alternative Scenario Triggered (${altSide} @ ${altEntry})`,
-                          from: 0,
-                          to: altTp2,
-                        });
-                        await insertAuditLog(supabase, {
-                          actor_type: "SYSTEM",
-                          action: "ALTERNATIVE_SCENARIO_TRIGGERED",
-                          entity_type: "trade_opportunities",
-                          entity_id: newFlipOpp.id,
-                          payload_json: {
-                            symbol: trade.symbol,
-                            previous_side: trade.side,
-                            new_side: altSide,
-                            entry: altEntry,
-                            pivot_sl: altSl,
-                            tp1: altTp1,
-                            tp2: altTp2,
-                            rationale: flipRationale,
-                          },
-                        });
-                      }
-                    }
-                  }
-                }
-              } catch (flipErr: any) {
-                console.error(`[Position Manager] Error triggering alternative scenario for ${trade.symbol}:`, flipErr);
-              }
+              // --- 1D. POST-INVALIDATION CLEAN CLOSURE (Anti-Whipsaw Gate) ---
+              // Deactivated blind instant market flips upon stop-out.
+              // Professional execution standards mandate exiting cleanly without churning the spread.
+              // Research agents (agent-day / agent-swing) evaluate fresh setups on subsequent bar closes.
+              console.log(`[Position Manager] Trade ${trade.symbol} (${orderId}) invalidated on bar close beyond pivot ($${pivotPoint}). Closed cleanly; instant flip suppressed to prevent whipsaw.`);
 
               continue;
             }
@@ -1582,19 +1516,20 @@ for (const [orderId, trade] of orderMap) {
           }
 
           const getDecimals = (sym: string) => {
-            if (["US30", "NAS100", "SPX500", "GER30", "BTCUSD", "XAUUSD", "XAGUSD", "UKOIL", "US500", "USTEC", "DE30", "JP225"].includes(sym)) return 2;
+            if (["US30", "NAS100", "SPX500", "GER30", "BTCUSD", "ETHUSD", "XAUUSD", "XAGUSD", "UKOIL", "US500", "USTEC", "DE30", "JP225"].includes(sym)) return 2;
             if (sym.endsWith("JPY")) return 3;
             return 5;
           };
 
           const getMinFrictionBuffer = (sym: string, dec: number, risk: number) => {
             let minPts = 0;
-            if (sym === "BTCUSD" || sym === "ETHUSD") minPts = 2.0;
-            else if (["US30", "NAS100", "SPX500", "GER30", "JP225", "DE30", "USTEC", "US500"].includes(sym)) minPts = 0.50;
-            else if (sym.includes("XAU") || sym.includes("XAG")) minPts = 0.25;
-            else if (sym.includes("OIL")) minPts = 0.05;
-            else if (dec === 3) minPts = 0.015;
-            else minPts = 0.00012;
+            if (sym === "BTCUSD") minPts = 35.0;
+            else if (sym === "ETHUSD") minPts = 3.0;
+            else if (["US30", "NAS100", "SPX500", "GER30", "JP225", "DE30", "USTEC", "US500"].includes(sym)) minPts = 1.00;
+            else if (sym.includes("XAU") || sym.includes("XAG")) minPts = 0.50;
+            else if (sym.includes("OIL")) minPts = 0.10;
+            else if (dec === 3) minPts = 0.020;
+            else minPts = 0.00025;
             return Math.max(risk * 0.05, minPts);
           };
 
@@ -1602,7 +1537,7 @@ for (const [orderId, trade] of orderMap) {
           if (!isSolvent && trade.status === "OPEN") {
              const profit = Number(position.profit) || 0;
              const currentVol = Number(position.volume) || 0.01;
-             const entryPrice = opp.entry_plan_json?.price || opp.entry_plan_json?.entry_price;
+             const entryPrice = Number(trade.open_price) || Number(position.openPrice) || opp.entry_plan_json?.price || opp.entry_plan_json?.entry_price;
              
              if (profit > 0 && entryPrice) {
                  const isLong = trade.side === "LONG" || trade.side === "BUY";
@@ -1707,7 +1642,7 @@ for (const [orderId, trade] of orderMap) {
 
           // --- 3. TRAILING STOP LOGIC ---
 
-          const entryPrice = opp.entry_plan_json?.price || opp.entry_plan_json?.entry_price;
+          const entryPrice = Number(trade.open_price) || Number(position.openPrice) || opp.entry_plan_json?.price || opp.entry_plan_json?.entry_price;
           const originalSl = opp.stop_plan_json?.initial || opp.stop_plan_json?.stop;
           const originalTp = opp.take_profit_json?.tp;
 
@@ -1722,6 +1657,7 @@ for (const [orderId, trade] of orderMap) {
 
           const isLong = trade.side === "LONG";
           
+
 
 
           const priceMoveInR = isLong
@@ -1753,7 +1689,7 @@ for (const [orderId, trade] of orderMap) {
             } else if (priceMoveInR >= 1.5) {
               steppedFloor = isLong ? entryPrice + (riskDist * 0.75) : entryPrice - (riskDist * 0.75);
               floorLabel = "LOCK_IN_0.75R";
-            } else if (priceMoveInR >= 0.35 || (tp1 && (isLong ? currentPrice >= tp1 : currentPrice <= tp1)) || profit > 0) {
+            } else if (priceMoveInR >= 1.0 || (tp1 && (isLong ? currentPrice >= tp1 : currentPrice <= tp1))) {
               steppedFloor = isLong ? entryPrice + minBuffer : entryPrice - minBuffer;
               floorLabel = "BREAK_EVEN_PROTECTED";
             }
@@ -1764,7 +1700,7 @@ for (const [orderId, trade] of orderMap) {
               candidateSl = isLong
                 ? Math.max(chandelierSl, steppedFloor)
                 : Math.min(chandelierSl, steppedFloor);
-            } else if (priceMoveInR >= 0.35) {
+            } else if (priceMoveInR >= 1.0) {
               candidateSl = chandelierSl;
             }
 
@@ -1807,12 +1743,12 @@ for (const [orderId, trade] of orderMap) {
                 newSl = lockSl;
                 actionName = `LOCK_IN_0.5R (profit +${priceMoveInR.toFixed(1)}R)`;
               }
-            } else if (priceMoveInR >= 0.35 || (tp1 && (isLong ? currentPrice >= tp1 : currentPrice <= tp1))) {
+            } else if (priceMoveInR >= 1.0 || (tp1 && (isLong ? currentPrice >= tp1 : currentPrice <= tp1))) {
               const beSl = Number((isLong ? entryPrice + minBuffer : entryPrice - minBuffer).toFixed(decimals));
               const isImprovement = isLong ? beSl > currentSl : beSl < currentSl;
               if (isImprovement) {
                 newSl = beSl;
-                actionName = `EARLY_BREAKEVEN_0.35R_OR_TP1 (profit +${priceMoveInR.toFixed(1)}R)`;
+                actionName = `BREAKEVEN_1.0R_OR_TP1 (profit +${priceMoveInR.toFixed(1)}R)`;
               }
             } else if (barsElapsed >= 20 && profit > 0 && priceMoveInR >= 0.50) {
               const beSl = Number((isLong ? entryPrice + minBuffer : entryPrice - minBuffer).toFixed(decimals));
@@ -1821,6 +1757,16 @@ for (const [orderId, trade] of orderMap) {
                 newSl = beSl;
                 actionName = `20_BAR_THESIS_DECAY_BE (aged ${barsElapsed.toFixed(1)} bars)`;
               }
+            }
+          }
+
+          if (newSl !== null) {
+            // Guard: Prevent moving SL within the noise floor / minimum safe distance from current market price
+            const minSafeDist = MIN_DISTANCES[trade.symbol] || 0;
+            const distToMarket = Math.abs(currentPrice - newSl);
+            if (minSafeDist > 0 && distToMarket < minSafeDist) {
+              console.log(`[Position Manager] Skipping SL move for ${trade.symbol}: distance to market (${distToMarket.toFixed(decimals)}) < min safe distance (${minSafeDist}).`);
+              newSl = null;
             }
           }
 
@@ -2108,13 +2054,7 @@ for (const [orderId, trade] of orderMap) {
     // === EXECUTION GUARD 1C: SPREAD BUFFER ON STOP LOSS ===
     // Pushes the Stop Loss slightly wider to prevent broker spread hunting
     if (defaultEntryPrice && stopLoss) {
-      const spreadBuffers: Record<string, number> = {
-        XAGUSD: 0.05, XAUUSD: 0.50, UKOIL: 0.05, BTCUSD: 25,
-        EURUSD: 0.0003, GBPUSD: 0.0003, USDJPY: 0.03, US30: 5, NAS100: 5,
-        AUDUSD: 0.0003, NZDUSD: 0.0003, EURJPY: 0.03, GBPJPY: 0.03,
-        JP225: 15, AAPL: 0.15, MSFT: 0.25, NVDA: 0.20, AMZN: 0.20, TSLA: 0.30, META: 0.35, GOOGL: 0.20,
-      };
-      const buffer = spreadBuffers[signal.symbol] || 0;
+      const buffer = SPREAD_BUFFERS[signal.symbol] || 0;
       if (buffer > 0) {
         const isLong = signal.side === "LONG" || signal.side === "BUY";
         const bufferedSl = isLong
@@ -2159,15 +2099,8 @@ for (const [orderId, trade] of orderMap) {
 
     // === EXECUTION GUARD 2: MINIMUM SL & TP DISTANCE ===
     // Prevents ultra-tight stops that get swept by spread/volatility.
-    const minDistances: Record<string, number> = {
-      XAGUSD: 0.30, XAUUSD: 2.00, UKOIL: 0.30, BTCUSD: 150,
-      EURUSD: 0.0010, GBPUSD: 0.0010, USDJPY: 0.15, US30: 30, NAS100: 30,
-      AUDUSD: 0.0010, NZDUSD: 0.0020, EURJPY: 0.15, GBPJPY: 0.15,
-      JP225: 150, AAPL: 1.50, MSFT: 2.00, NVDA: 1.50, AMZN: 1.50, TSLA: 2.50, META: 3.00, GOOGL: 1.50,
-    };
-    
     if (defaultEntryPrice) {
-      const minDist = minDistances[signal.symbol];
+      const minDist = MIN_DISTANCES[signal.symbol];
       if (minDist) {
         // Validate Stop Loss Distance
         if (stopLoss) {
@@ -2178,6 +2111,15 @@ for (const [orderId, trade] of orderMap) {
               : Number((defaultEntryPrice + minDist).toFixed(5));
             console.warn(`[Execution Guard] SL too tight on ${signal.symbol}: ${currentSlDist.toFixed(5)} < min ${minDist}. Widening from ${stopLoss} → ${correctedSl}.`);
             stopLoss = correctedSl;
+
+            // Persist corrected SL to the DB so MT5 VPS EA receives the widened stop
+            const updatedStopJson = {
+              ...signal.stop_plan_json,
+              stop: correctedSl,
+              stop_price: correctedSl
+            };
+            await supabase.from("trade_opportunities").update({ stop_plan_json: updatedStopJson }).eq("id", signal.id);
+            signal.stop_plan_json = updatedStopJson;
           }
         }
         
@@ -2216,8 +2158,8 @@ for (const [orderId, trade] of orderMap) {
 
     if (pivotPoint > 0 && stopLoss && defaultEntryPrice) {
       const isLong = signal.side === "LONG" || signal.side === "BUY";
-      const dynamicBuffer = atrValue > 0 ? (atrValue * 0.50) : (minDistances[signal.symbol] ? minDistances[signal.symbol] * 0.75 : 0.0015);
-      const minLevelBuffer = minDistances[signal.symbol] ? minDistances[signal.symbol] * 0.50 : 0.0010;
+      const dynamicBuffer = atrValue > 0 ? (atrValue * 0.50) : (MIN_DISTANCES[signal.symbol] ? MIN_DISTANCES[signal.symbol] * 0.75 : 0.0015);
+      const minLevelBuffer = MIN_DISTANCES[signal.symbol] ? MIN_DISTANCES[signal.symbol] * 0.50 : 0.0010;
       const effectiveBuffer = Math.max(dynamicBuffer, minLevelBuffer);
 
       if (isLong) {
