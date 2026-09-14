@@ -59,6 +59,24 @@ def query_table(table: str, params: str = "") -> list:
         print(f"Network error querying {table}: {e}")
         return []
 
+def call_rpc(rpc_name: str, body: dict = None):
+    """Call a PostgreSQL RPC via Supabase REST API using service role key."""
+    url = f"{rest_url}/rpc/{rpc_name}"
+    data = json.dumps(body or {}).encode("utf-8")
+    req = urllib.request.Request(url, data=data)
+    req.add_header("apikey", service_role_key)
+    req.add_header("Authorization", f"Bearer {service_role_key}")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req) as response:
+            return json.loads(response.read().decode())
+    except urllib.error.HTTPError as e:
+        print(f"Error calling RPC {rpc_name}: {e.code} - {e.read().decode()}")
+        return None
+    except Exception as e:
+        print(f"Network error calling RPC {rpc_name}: {e}")
+        return None
+
 def parse_iso(dt_str: str):
     """Safely parse ISO timestamp across various formats and Python versions."""
     if not dt_str:
@@ -90,6 +108,33 @@ print(f"========================================================================
 print(f"=== RAINE INVEST SYSTEM HEALTH CHECK — {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')} ===")
 print(f"================================================================================")
 
+# 0. Background Crons, Webhooks & Vault RPC Diagnostics
+print("\n--- 0. BACKGROUND CRONS, WEBHOOKS & VAULT SECRETS (RPC) ---")
+cron_failures = call_rpc("check_cron_failures")
+if cron_failures is not None:
+    if len(cron_failures) == 0:
+        print("  🟢 pg_cron Jobs: 0 failures across all background jobs. Clean!")
+    else:
+        print(f"  🚨 pg_cron FAILURES DETECTED ({len(cron_failures)} failed runs):")
+        for cf in cron_failures:
+            print(f"     • [{cf.get('jobname')}] Status: {cf.get('status')} | Message: {cf.get('return_message')}")
+
+http_errors = call_rpc("check_http_response_errors")
+if http_errors is not None:
+    if len(http_errors) == 0:
+        print("  🟢 HTTP Responses: 0 webhook or net response errors in last hour. Clean!")
+    else:
+        print(f"  ⚠️ HTTP / Webhook Response Errors ({len(http_errors)} detected):")
+        for he in http_errors[:5]:
+            print(f"     • Status: {he.get('status_code')} | Err: {he.get('error_msg')} | Content: {str(he.get('content'))[:80]}")
+
+vault_health = call_rpc("check_vault_secrets_health")
+if vault_health is not None:
+    if isinstance(vault_health, dict) and not vault_health.get("is_desynced"):
+        print(f"  🟢 Vault Secrets: {vault_health.get('message', 'Synchronized and healthy')}")
+    else:
+        print(f"  🚨 Webhook Vault Secrets Desynced: {vault_health}")
+
 # 1. Edge Function Agent Crashes
 print("\n--- 1. AGENT CRASHES (audit_log) ---")
 crashes = query_table("audit_log", "action=eq.AGENT_CRASH&order=created_at.desc&limit=10")
@@ -99,15 +144,30 @@ if crashes:
 else:
     print("  Zero AGENT_CRASH entries found. Clean!")
 
-# 1b. AI Evaluation Model Timeouts / API Outages
-print("\n--- 1b. AI MODEL TIMEOUTS / OUTAGES (audit_log) ---")
+# 1b. AI Evaluation Model Timeouts / API Outages & Parameter Errors
+print("\n--- 1b. AI MODEL TIMEOUTS & API / PARAMETER ERRORS (audit_log) ---")
 timeouts = query_table("audit_log", "action=eq.API_TIMEOUT&order=created_at.desc&limit=5")
 if timeouts:
     for to in timeouts:
         payload = to.get('payload_json') or {}
-        print(f"  [{to.get('created_at')}] Symbol: {payload.get('symbol')} | Reason: {payload.get('reason')} | Err: {str(payload.get('error'))[:100]}")
+        print(f"  ⚠️ [{to.get('created_at')}] API_TIMEOUT | Symbol: {payload.get('symbol')} | Reason: {payload.get('reason')} | Err: {str(payload.get('error'))[:100]}")
 else:
     print("  Zero recent API_TIMEOUT entries found. Clean!")
+
+ai_errors = query_table("audit_log", "action=in.(AI_API_ERROR,AI_QUOTA_EXHAUSTED,OPENAI_QUOTA_EXHAUSTED)&order=created_at.desc&limit=5")
+if ai_errors:
+    for aie in ai_errors:
+        payload = aie.get('payload_json') or {}
+        print(f"  ⚠️ [{aie.get('created_at')}] {aie.get('action')} | {json.dumps(payload)[:120]}")
+else:
+    print("  Zero AI_API_ERROR or Quota Exhaustion entries found. Clean!")
+
+tg_failures = query_table("audit_log", "action=eq.TELEGRAM_BROADCAST_FAILURE&order=created_at.desc&limit=5")
+if tg_failures:
+    for tgf in tg_failures:
+        print(f"  🚨 [{tgf.get('created_at')}] TELEGRAM_BROADCAST_FAILURE | {json.dumps(tgf.get('payload_json'))[:120]}")
+else:
+    print("  Zero TELEGRAM_BROADCAST_FAILURE entries found. Clean!")
 
 # 2. Recent Autonomous Agent Research Runs
 print("\n--- 2. RECENT AGENT ACTIVITY (RESEARCH_RUN) ---")
@@ -129,12 +189,15 @@ if recent_actions:
         payload = a.get('payload_json') or {}
         print(f"  [{a.get('created_at')}] Action: {a.get('action')} | Actor: {a.get('actor_type')} | Payload: {json.dumps(payload)[:120]}")
 
-# 4. Trade Opportunities Analysis
+# 4. Trade Opportunities Analysis & Status Constraint Validation
 print("\n--- 4. TRADE OPPORTUNITIES (Last 15) ---")
+CANONICAL_OPP_STATUSES = {"PENDING_APPROVAL", "PUBLISHED", "ACTIVE", "EXECUTED", "APPROVED", "REJECTED", "WON", "LOST", "EXPIRED"}
 opps = query_table("trade_opportunities", "order=created_at.desc&limit=15")
 if opps:
     for o in opps:
-        print(f"  [{o.get('created_at')}] ID: {o.get('id')} | {o.get('symbol')} {o.get('side')} | Status: {o.get('status')} | Source: {o.get('source')} | Confidence: {o.get('confidence')}")
+        stat = o.get('status')
+        status_flag = "🟢" if stat in CANONICAL_OPP_STATUSES else "🚨 [INVALID STATUS]"
+        print(f"  [{o.get('created_at')}] ID: {o.get('id')} | {o.get('symbol')} {o.get('side')} | {status_flag} Status: {stat} | Source: {o.get('source')} | Confidence: {o.get('confidence')}")
         if o.get('ai_risks'):
             print(f"      Risks: {str(o.get('ai_risks'))[:120]}")
         if o.get('ai_summary'):
